@@ -1,0 +1,12 @@
+# Windows runtime dependencies
+pynput>=1.7.7
+pyautogui>=0.9.54
+Pillow>=10.0.0
+requests>=2.31.0
+pydantic>=2.7,<3
+pyperclip>=1.8.2
+pywinauto>=0.6.8
+pytesseract>=0.3.13
+
+# Optional build dependency on Windows
+pyinstaller>=6.10.0

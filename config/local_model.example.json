@@ -1,0 +1,8 @@
+{
+  "endpoint": "http://127.0.0.1:11434/v1",
+  "model": "gemma4:e2b",
+  "timeout": 120,
+  "vision": false,
+  "dry_run": true,
+  "capture_on_error": true
+}
