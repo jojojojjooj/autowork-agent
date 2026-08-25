@@ -187,12 +187,14 @@ class Workflow:
     name: str = "새 작업"
     description: str = ""
     steps: List[Step] = field(default_factory=list)
+    recorded_screen_size: Optional[List[int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "version": WORKFLOW_VERSION,
             "name": self.name[:200],
             "description": self.description[:2000],
+            "recorded_screen_size": self.recorded_screen_size,
             "steps": [asdict(step) for step in self.steps],
         }
 
@@ -237,9 +239,30 @@ class Workflow:
             steps.append(step)
         name = data.get("name", "불러온 작업")
         description = data.get("description", "")
+        recorded_screen_size = data.get("recorded_screen_size")
         if not isinstance(name, str) or not isinstance(description, str):
             raise ValueError("작업 이름과 설명은 문자열이어야 합니다.")
-        return cls(name=name[:200] or "불러온 작업", description=description[:2000], steps=steps)
+        if recorded_screen_size is not None:
+            if not isinstance(recorded_screen_size, (list, tuple)) or len(recorded_screen_size) != 2:
+                raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.")
+            try:
+                recorded_screen_size = [int(recorded_screen_size[0]), int(recorded_screen_size[1])]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.") from exc
+            if any(value <= 0 for value in recorded_screen_size):
+                raise ValueError("기록 당시 화면 크기는 양수여야 합니다.")
+        return cls(
+            name=name[:200] or "불러온 작업",
+            description=description[:2000],
+            steps=steps,
+            recorded_screen_size=recorded_screen_size,
+        )
+
+    def remove_step(self, index: int) -> Step:
+        """Remove and return one step using a zero-based index."""
+        if not 0 <= index < len(self.steps):
+            raise IndexError("삭제할 작업 단계가 없습니다.")
+        return self.steps.pop(index)
 
 
 class InputRecorder:
@@ -490,6 +513,18 @@ def ensure_app_dirs() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ERROR_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_screen_size() -> Optional[tuple[int, int]]:
+    """Return the current primary screen size when the GUI backend is available."""
+    if pyautogui is None:
+        return None
+    try:
+        width, height = pyautogui.size()
+        width, height = int(width), int(height)
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
 
 
 def capture_observation() -> Dict[str, Any]:

@@ -26,6 +26,7 @@ def test_workflow_roundtrip(tmp_path: Path):
             Step(type="click", delay=0.2, x=100, y=200, button="left"),
             Step(type="key", delay=0.1, event="down", kind="char", value="a"),
         ],
+        recorded_screen_size=[1920, 1080],
     )
     path = tmp_path / "workflow.json"
     save_workflow(original, path)
@@ -34,6 +35,23 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert len(loaded.steps) == 2
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
+    assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_workflow_remove_step():
+    workflow = Workflow(steps=[Step(type="wait", value="1"), Step(type="wait", value="2")])
+    removed = workflow.remove_step(0)
+    assert removed.value == "1"
+    assert len(workflow.steps) == 1
+    with pytest.raises(IndexError):
+        workflow.remove_step(3)
+
+
+def test_workflow_rejects_invalid_screen_metadata():
+    with pytest.raises(ValueError, match="화면 크기"):
+        Workflow.from_dict({"version": 2, "recorded_screen_size": [0, 1080], "steps": []})
+    with pytest.raises(ValueError, match="화면 크기"):
+        Workflow.from_dict({"version": 2, "recorded_screen_size": [1920], "steps": []})
 
 
 def test_ai_plan_validation():

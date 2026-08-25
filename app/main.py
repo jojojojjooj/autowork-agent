@@ -23,6 +23,7 @@ from engine import (
     UserInterventionRequired,
     Step,
     Workflow,
+    get_screen_size,
     WorkflowPlayer,
     append_log,
     capture_observation,
@@ -131,6 +132,7 @@ class AutoWorkAgent(tk.Tk):
         self.pause_play_button = ttk.Button(top, text="재생 일시정지", command=self._toggle_pause_playback, state="disabled")
         self.pause_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="재생 중지", command=self._stop_playback).pack(side="left")
+        ttk.Button(top, text="선택 단계 삭제", command=self._delete_selected_step).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="저장", command=self._save_workflow).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="불러오기", command=self._load_workflow).pack(side="right")
 
@@ -152,6 +154,9 @@ class AutoWorkAgent(tk.Tk):
         ttk.Label(name_row, text="단계 수:").pack(side="left", padx=(24, 4))
         self.step_count_var = tk.StringVar(value="0")
         ttk.Label(name_row, textvariable=self.step_count_var).pack(side="left")
+        ttk.Label(name_row, text="기록 화면:").pack(side="left", padx=(24, 4))
+        self.recorded_screen_var = tk.StringVar(value="미기록")
+        ttk.Label(name_row, textvariable=self.recorded_screen_var, style="Sub.TLabel").pack(side="left")
 
         table_frame = ttk.Frame(self.record_tab)
         table_frame.pack(fill="both", expand=True)
@@ -165,6 +170,7 @@ class AutoWorkAgent(tk.Tk):
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.step_tree.yview)
         self.step_tree.configure(yscrollcommand=scroll.set)
         self.step_tree.pack(side="left", fill="both", expand=True)
+        self.step_tree.bind("<Delete>", lambda _event: self._delete_selected_step())
         scroll.pack(side="right", fill="y")
 
         footer = ttk.Frame(self.record_tab)
@@ -375,6 +381,8 @@ class AutoWorkAgent(tk.Tk):
             self._append_step_row_without_mutation(step)
         self.step_count_var.set(str(len(self.workflow.steps)))
         self.workflow_name_var.set(self.workflow.name)
+        recorded_size = self.workflow.recorded_screen_size
+        self.recorded_screen_var.set(f"{recorded_size[0]}×{recorded_size[1]}" if recorded_size else "미기록")
 
     def _append_step_row_without_mutation(self, step: Step) -> None:
         index = len(self.step_tree.get_children()) + 1
@@ -386,12 +394,34 @@ class AutoWorkAgent(tk.Tk):
             detail = f"키 {step.event or ''}: {step.value or ''}"
         self.step_tree.insert("", "end", values=(index, step.type, f"{step.delay:.3f}", position, detail))
 
+    def _delete_selected_step(self) -> None:
+        if self.recording or self.player.running:
+            messagebox.showwarning("작업 실행 중", "기록 또는 재생 중에는 단계를 삭제할 수 없습니다.")
+            return
+        selection = self.step_tree.selection()
+        if not selection:
+            messagebox.showinfo("단계 선택 필요", "삭제할 단계를 먼저 선택하세요.")
+            return
+        item = selection[0]
+        try:
+            index = int(self.step_tree.item(item, "values")[0]) - 1
+            removed = self.workflow.remove_step(index)
+        except (IndexError, TypeError, ValueError) as exc:
+            messagebox.showerror("단계 삭제 실패", str(exc))
+            return
+        self._refresh_steps()
+        self._set_status(f"단계 삭제 완료 · {removed.type} · 남은 단계 {len(self.workflow.steps)}개")
+
     def _start_recording(self) -> None:
         if self.player.running:
             messagebox.showwarning("재생 중", "재생을 먼저 중지하세요.")
             return
         try:
-            self.workflow = Workflow(name=self.workflow_name_var.get().strip() or "새 작업")
+            recorded_size = get_screen_size()
+            self.workflow = Workflow(
+                name=self.workflow_name_var.get().strip() or "새 작업",
+                recorded_screen_size=list(recorded_size) if recorded_size else None,
+            )
             self._refresh_steps()
             self.recorder.start(clear=True)
         except Exception as exc:
@@ -439,6 +469,16 @@ class AutoWorkAgent(tk.Tk):
         if not self.workflow.steps:
             messagebox.showinfo("재생할 작업 없음", "먼저 작업을 기록하거나 파일을 불러오세요.")
             return
+        recorded_size = self.workflow.recorded_screen_size
+        current_size = get_screen_size()
+        if recorded_size and current_size and tuple(recorded_size) != current_size:
+            if not messagebox.askyesno(
+                "화면 크기 불일치",
+                f"기록 당시 화면: {recorded_size[0]}×{recorded_size[1]}\n"
+                f"현재 화면: {current_size[0]}×{current_size[1]}\n\n"
+                "좌표 기반 재생의 위치가 달라질 수 있습니다. 그래도 계속하시겠습니까?",
+            ):
+                return
         ok = messagebox.askyesno(
             "재생 확인",
             "저장된 모든 마우스·키보드 동작을 현재 화면에서 실행합니다.\n\n"            "민감한 정보 입력이나 문서 전송이 포함되어 있지 않은지 확인했습니까?",
