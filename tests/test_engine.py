@@ -12,6 +12,8 @@ from app.engine import (
     WorkflowPlayer,
     append_execution_history,
     read_execution_history,
+    trim_execution_history,
+    inspect_workflow,
     load_workflow,
     save_workflow,
     validate_ai_steps,
@@ -113,6 +115,25 @@ def test_ai_plan_rejects_direct_coordinates():
     valid, message = validate_ai_steps({"steps": [{"action": "click", "x": 10, "y": 20}]}, (1920, 1080), {"elements": []})
     assert valid is False
     assert "구조화 계획 형식 오류" in message or "element_id" in message
+
+
+def test_workflow_inspection_reports_counts_and_screen_warning():
+    workflow = Workflow(
+        steps=[
+            Step(type="click", x=100, y=100, button="left", window_title="문서 - 메모장"),
+            Step(type="key", event="down", kind="char", value="a"),
+            Step(type="wait", value="1"),
+        ],
+        recorded_screen_size=[1920, 1080],
+    )
+    report = inspect_workflow(workflow, (1280, 720))
+    assert report["valid"] is True
+    assert report["step_count"] == 3
+    assert report["click_count"] == 1
+    assert report["key_count"] == 1
+    assert report["wait_count"] == 1
+    assert report["window_titles"] == ["문서 - 메모장"]
+    assert report["warnings"]
 
 
 def test_workflow_rejects_out_of_bounds_click():
@@ -220,7 +241,22 @@ def test_ai_plan_rejects_zero_scroll_and_oversized_text():
     assert "너무 깁니다" in message
 
 
-def test_execution_history_is_local_and_redacts_payload(tmp_path: Path, monkeypatch):
+def test_execution_history_is_bounded(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "WORKFLOW_DIR", tmp_path / "app" / "workflows")
+    monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "app" / "cache")
+    monkeypatch.setattr(engine, "ERROR_DIR", tmp_path / "app" / "errors")
+    monkeypatch.setattr(engine, "DEBUG_DIR", tmp_path / "app" / "debug_snapshots")
+    monkeypatch.setattr(engine, "TEMPLATE_DIR", tmp_path / "app" / "templates")
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "app" / "history.jsonl")
+    for index in range(20):
+        append_execution_history("test_event", Workflow(name=f"workflow-{index}"), detail="x" * 100)
+    trim_execution_history(1024)
+    assert engine.HISTORY_PATH.stat().st_size <= 1024
+    assert read_execution_history(100)
+
+
+def test_execution_history_is_local_and_redacted(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
     monkeypatch.setattr(engine, "TEMPLATE_DIR", tmp_path / "app" / "templates")
     monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "app" / "history.jsonl")
