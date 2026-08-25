@@ -63,6 +63,8 @@ MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
+AUDIT_HASH_VERSION = 1
+AUDIT_GENESIS = "0" * 64
 MAX_WORKFLOW_BACKUPS = 20
 CHECKPOINT_VERSION = 1
 SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
@@ -128,32 +130,86 @@ def append_log(message: str, level: str = "INFO") -> None:
             handle.write(line)
 
 
+def _audit_hash(record: Dict[str, Any]) -> str:
+    payload = {key: value for key, value in record.items() if key != "record_hash"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _last_audit_hash() -> str:
+    if not HISTORY_PATH.exists():
+        return AUDIT_GENESIS
+    try:
+        for line in reversed(HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()):
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and isinstance(data.get("record_hash"), str) and len(data["record_hash"]) == 64:
+                return data["record_hash"]
+    except OSError:
+        pass
+    return AUDIT_GENESIS
+
+
 def append_execution_history(event: str, workflow: Optional["Workflow"] = None, **details: Any) -> None:
-    """Append a privacy-conscious execution event to a local JSONL file."""
+    """Append a privacy-conscious, hash-chained execution event to local JSONL."""
     ensure_app_dirs()
-    record: Dict[str, Any] = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "event": str(event)[:80],
-        "workflow": workflow.name[:200] if workflow else "",
-        "step_count": len(workflow.steps) if workflow else 0,
-    }
-    for key, value in details.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            record[str(key)[:80]] = value
-    line = json.dumps(record, ensure_ascii=False) + "\n"
     try:
         with _HISTORY_LOCK:
             if HISTORY_PATH.exists() and HISTORY_PATH.stat().st_size >= MAX_HISTORY_FILE_BYTES:
                 previous = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
                 temporary = HISTORY_PATH.with_name(f".{HISTORY_PATH.name}.tmp")
-                temporary.write_text("\n".join(previous[-MAX_HISTORY_RECORDS_ON_ROTATE:]) + "\n", encoding="utf-8")
+                kept = previous[-MAX_HISTORY_RECORDS_ON_ROTATE:]
+                temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
                 os.replace(temporary, HISTORY_PATH)
+            record: Dict[str, Any] = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": str(event)[:80],
+                "workflow": workflow.name[:200] if workflow else "",
+                "step_count": len(workflow.steps) if workflow else 0,
+                "audit_hash_version": AUDIT_HASH_VERSION,
+                "previous_hash": _last_audit_hash(),
+            }
+            for key, value in details.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    record[str(key)[:80]] = value
+            record["record_hash"] = _audit_hash(record)
             with HISTORY_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         trim_execution_history()
     except OSError as exc:
         # Audit history is useful but must never block the requested automation.
         append_log(f"실행 이력 저장 실패: {exc}", "WARNING")
+
+
+def verify_execution_history(records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Verify hash and previous-hash links for retained audit records."""
+    items = records if records is not None else read_execution_history(2_000)
+    issues: List[str] = []
+    checked = 0
+    legacy = 0
+    previous_hash: Optional[str] = None
+    first_hashed_record = True
+    anchored = False
+    for index, record in enumerate(items):
+        stored = record.get("record_hash")
+        if not isinstance(stored, str):
+            legacy += 1
+            previous_hash = None
+            continue
+        expected = _audit_hash(record)
+        if stored != expected:
+            issues.append(f"record_{index}_hash_mismatch")
+        link = record.get("previous_hash")
+        if previous_hash is not None and link != previous_hash:
+            issues.append(f"record_{index}_link_mismatch")
+        if first_hashed_record:
+            anchored = record.get("previous_hash") == AUDIT_GENESIS
+            first_hashed_record = False
+        checked += 1
+        previous_hash = stored
+    return {"valid": not issues, "anchored": anchored, "checked_records": checked, "legacy_records": legacy, "issues": issues[:20]}
 
 
 def validate_schedule_interval(value: Any) -> int:
@@ -301,6 +357,10 @@ def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] 
     """Build a privacy-conscious operational snapshot without steps or input values."""
     records = read_execution_history(2_000)
     summary = summarize_execution_history(records)
+    audit_integrity = verify_execution_history(records)
+    alerts = evaluate_monitor_alerts(summary)
+    if not audit_integrity["valid"]:
+        alerts.insert(0, {"severity": "critical", "code": "audit_integrity_failure", "message": "실행 감사 이력의 무결성 검증에 실패했습니다."})
     checkpoint = load_execution_checkpoint()
     return redact_sensitive({
         "schema_version": MONITOR_SCHEMA_VERSION,
@@ -313,7 +373,8 @@ def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] 
         "current_step": current_step if current_step is None else max(0, int(current_step)),
         "checkpoint_pending": bool(checkpoint),
         "summary": summary,
-        "alerts": evaluate_monitor_alerts(summary),
+        "audit_integrity": audit_integrity,
+        "alerts": alerts,
     })
 
 

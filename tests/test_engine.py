@@ -41,6 +41,7 @@ from app.engine import (
     validate_workflow,
     resolve_observed_element,
     verify_workflow_signature,
+    verify_execution_history,
     save_prompt_template,
     load_prompt_template,
     render_prompt_template,
@@ -67,6 +68,20 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
     assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_execution_history_hash_chain_detects_tampering(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "app" / "history.jsonl")
+    append_execution_history("first")
+    append_execution_history("second")
+    records = read_execution_history()
+    integrity = verify_execution_history(records)
+    assert integrity["valid"] is True
+    assert integrity["checked_records"] == 2
+    assert integrity["anchored"] is True
+    records[0]["event"] = "tampered"
+    assert verify_execution_history(records)["valid"] is False
 
 
 def test_monitor_alerts_are_deterministic():
