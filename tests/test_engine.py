@@ -15,11 +15,16 @@ from app.engine import (
     WorkflowPlayer,
     append_execution_history,
     backup_workflow,
+    build_monitor_snapshot,
     cleanup_workflow_backups,
+    evaluate_monitor_alerts,
+    export_support_bundle,
     clear_execution_checkpoint,
     load_execution_checkpoint,
     save_execution_checkpoint,
     list_workflow_backups,
+    read_monitor_snapshot,
+    write_monitor_snapshot,
     mask_sensitive_text,
     read_execution_history,
     sign_workflow,
@@ -60,6 +65,29 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
     assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_monitor_alerts_are_deterministic():
+    alerts = evaluate_monitor_alerts({"completed_runs": 1, "failed_runs": 3, "success_rate": 25.0})
+    assert [item["code"] for item in alerts] == ["repeated_failures", "low_success_rate"]
+    assert evaluate_monitor_alerts({"completed_runs": 0, "failed_runs": 0, "success_rate": None})[0]["code"] == "no_runs"
+
+
+def test_monitor_snapshot_and_support_bundle_are_redacted(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "MONITOR_STATE_PATH", tmp_path / "app" / "monitor.json")
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "app" / "history.jsonl")
+    monkeypatch.setattr(engine, "LOG_PATH", tmp_path / "app" / "autowork.log")
+    monkeypatch.setattr(engine, "ERROR_DIR", tmp_path / "app" / "errors")
+    snapshot = build_monitor_snapshot(status="idle")
+    snapshot["secret"] = "password-value"
+    write_monitor_snapshot(snapshot)
+    loaded = read_monitor_snapshot()
+    assert loaded is not None and loaded["secret"].startswith("<redacted:")
+    bundle_path = export_support_bundle(tmp_path / "bundle.json")
+    bundle_text = bundle_path.read_text(encoding="utf-8")
+    assert "password-value" not in bundle_text
+    assert "Workflow 단계" in bundle_text
 
 
 def test_execution_checkpoint_roundtrip(tmp_path: Path, monkeypatch):

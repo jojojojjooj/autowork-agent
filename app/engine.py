@@ -49,6 +49,7 @@ WORKFLOW_KEY_PATH = APP_DIR / "workflow.key"
 LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
 CHECKPOINT_PATH = APP_DIR / "execution_checkpoint.json"
+MONITOR_STATE_PATH = APP_DIR / "monitor_state.json"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WORKFLOW_VERSION = 2
 MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
@@ -70,6 +71,7 @@ PII_PATTERNS = (
 )
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
+_MONITOR_LOCK = threading.Lock()
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -272,6 +274,108 @@ def summarize_execution_history(records: Optional[List[Dict[str, Any]]] = None) 
         "events": dict(events),
         "last_event": items[-1].get("event") if items else None,
     }
+
+
+MONITOR_SCHEMA_VERSION = 1
+
+
+def evaluate_monitor_alerts(summary: Dict[str, Any], min_runs: int = 3, failure_threshold_percent: float = 50.0) -> List[Dict[str, Any]]:
+    """Return deterministic local alerts from bounded execution statistics."""
+    alerts: List[Dict[str, Any]] = []
+    failed = int(summary.get("failed_runs", 0) or 0)
+    completed = int(summary.get("completed_runs", 0) or 0)
+    runs = failed + completed
+    if failed >= 3:
+        alerts.append({"severity": "high", "code": "repeated_failures", "message": f"최근 실행에서 {failed}건의 실패가 누적되었습니다."})
+    success_rate = summary.get("success_rate")
+    if runs >= max(1, int(min_runs)) and success_rate is not None and float(success_rate) < max(0.0, float(100.0 - failure_threshold_percent)):
+        alerts.append({"severity": "medium", "code": "low_success_rate", "message": f"성공률이 {float(success_rate):.1f}%로 기준보다 낮습니다."})
+    if not runs:
+        alerts.append({"severity": "info", "code": "no_runs", "message": "아직 완료 또는 실패한 실행 기록이 없습니다."})
+    return alerts
+
+
+def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] = None, scheduler_running: bool = False, current_step: Optional[int] = None) -> Dict[str, Any]:
+    """Build a privacy-conscious operational snapshot without steps or input values."""
+    records = read_execution_history(2_000)
+    summary = summarize_execution_history(records)
+    checkpoint = load_execution_checkpoint()
+    return redact_sensitive({
+        "schema_version": MONITOR_SCHEMA_VERSION,
+        "heartbeat_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": str(status)[:160],
+        "workflow_name": workflow.name[:200] if workflow else "",
+        "workflow_step_count": len(workflow.steps) if workflow else 0,
+        "workflow_signed": bool(workflow and workflow.signature),
+        "scheduler_running": bool(scheduler_running),
+        "current_step": current_step if current_step is None else max(0, int(current_step)),
+        "checkpoint_pending": bool(checkpoint),
+        "summary": summary,
+        "alerts": evaluate_monitor_alerts(summary),
+    })
+
+
+def write_monitor_snapshot(snapshot: Dict[str, Any]) -> Path:
+    """Atomically persist the latest local monitor snapshot."""
+    ensure_app_dirs()
+    payload = redact_sensitive(dict(snapshot))
+    payload.setdefault("schema_version", MONITOR_SCHEMA_VERSION)
+    temporary = MONITOR_STATE_PATH.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _MONITOR_LOCK:
+            os.replace(temporary, MONITOR_STATE_PATH)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return MONITOR_STATE_PATH
+
+
+def read_monitor_snapshot() -> Optional[Dict[str, Any]]:
+    """Read a local monitor snapshot, rejecting malformed or unsupported state."""
+    try:
+        with _MONITOR_LOCK:
+            data = json.loads(MONITOR_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema_version") != MONITOR_SCHEMA_VERSION:
+            return None
+        return redact_sensitive(data)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def export_support_bundle(target: Path) -> Path:
+    """Export a bounded, local-only support bundle without workflow steps or screenshots."""
+    ensure_app_dirs()
+    logs = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-300:] if LOG_PATH.exists() else []
+    errors = []
+    for path in sorted(ERROR_DIR.glob("error_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:50]:
+        try:
+            errors.append({"name": path.name, "size_bytes": path.stat().st_size})
+        except OSError:
+            continue
+    snapshot = read_monitor_snapshot() or build_monitor_snapshot()
+    bundle = redact_sensitive({
+        "schema_version": MONITOR_SCHEMA_VERSION,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "monitor": snapshot,
+        "recent_events": read_execution_history(200),
+        "recent_logs": logs,
+        "error_reports": errors,
+        "note": "이 패키지에는 Workflow 단계, 키 입력, 화면 캡처 원문을 포함하지 않습니다.",
+    })
+    destination = Path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(encoded) > 5 * 1024 * 1024:
+        raise ValueError("지원 진단 패키지가 5MB 제한을 초과했습니다.")
+    temporary = destination.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(encoded)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
 
 
 def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workflow_signature: str = "", mode: str = "playback", error_type: str = "") -> None:

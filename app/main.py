@@ -35,6 +35,10 @@ from engine import (
     append_execution_history,
     read_execution_history,
     summarize_execution_history,
+    build_monitor_snapshot,
+    write_monitor_snapshot,
+    read_monitor_snapshot,
+    export_support_bundle,
     capture_observation,
     cleanup_expired_artifacts,
     ensure_app_dirs,
@@ -328,6 +332,8 @@ class AutoWorkAgent(tk.Tk):
         top.pack(fill="x", pady=(0, 10))
         ttk.Button(top, text="로그 새로고침", command=self._refresh_log_view).pack(side="left")
         ttk.Button(top, text="실행 이력 새로고침", command=self._refresh_history_view).pack(side="left", padx=6)
+        ttk.Button(top, text="운영 상태 새로고침", command=self._refresh_monitor_view).pack(side="left", padx=6)
+        ttk.Button(top, text="지원 패키지 저장", command=self._export_support_bundle).pack(side="left", padx=6)
         ttk.Button(top, text="로그 폴더 열기", command=self._open_log_folder).pack(side="left", padx=6)
         self.capture_on_error_enabled = bool(self._config_data.get("capture_on_error", True))
         self.capture_on_error_var = tk.BooleanVar(value=self.capture_on_error_enabled)
@@ -340,7 +346,9 @@ class AutoWorkAgent(tk.Tk):
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
         self.last_action_var = tk.StringVar(value="최근 상태: 대기 중")
-        ttk.Label(self.debug_tab, textvariable=self.last_action_var, style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(self.debug_tab, textvariable=self.last_action_var, style="Sub.TLabel").pack(anchor="w", pady=(0, 4))
+        self.monitor_status_var = tk.StringVar(value="운영 모니터: 확인 전")
+        ttk.Label(self.debug_tab, textvariable=self.monitor_status_var, style="Sub.TLabel", wraplength=950, justify="left").pack(anchor="w", pady=(0, 8))
         body = ttk.Panedwindow(self.debug_tab, orient="vertical")
         body.pack(fill="both", expand=True)
         log_frame = ttk.LabelFrame(body, text="최근 로그", style="Card.TLabelframe")
@@ -359,6 +367,8 @@ class AutoWorkAgent(tk.Tk):
         history_scroll.pack(side="right", fill="y")
         self._refresh_log_view()
         self._refresh_history_view()
+        self._refresh_monitor_view()
+        self.after(30_000, self._monitor_heartbeat)
 
     def _refresh_log_view(self) -> None:
         if not hasattr(self, "log_text"):
@@ -385,6 +395,52 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             text = f"실행 이력을 읽을 수 없습니다: {exc}"
         self._set_text(self.history_text, text)
+
+    def _refresh_monitor_view(self, status_override: Optional[str] = None) -> None:
+        if not hasattr(self, "monitor_status_var"):
+            return
+        try:
+            snapshot = build_monitor_snapshot(
+                status=status_override or self.status_var.get(),
+                workflow=self.workflow,
+                scheduler_running=self.scheduler.running,
+                current_step=self.player.current_index if self.player.running else None,
+            )
+            write_monitor_snapshot(snapshot)
+            alerts = snapshot.get("alerts", [])
+            alert_text = " / ".join(str(item.get("message", "")) for item in alerts[:3]) or "현재 경보 없음"
+            summary = snapshot.get("summary", {})
+            self.monitor_status_var.set(
+                f"운영 모니터: {snapshot.get('heartbeat_at', '-')} · 상태 {snapshot.get('status', '-')} · "
+                f"성공률 {summary.get('success_rate', '-')} · 경보 {len(alerts)}개 · {alert_text}"
+            )
+        except Exception as exc:
+            self.monitor_status_var.set(f"운영 모니터 오류: {exc}")
+
+    def _monitor_heartbeat(self) -> None:
+        try:
+            self._refresh_monitor_view()
+            self.after(30_000, self._monitor_heartbeat)
+        except tk.TclError:
+            return
+
+    def _export_support_bundle(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="지원 진단 패키지 저장",
+            initialdir=str(APP_DIR),
+            initialfile="autowork_support_bundle.json",
+            defaultextension=".json",
+            filetypes=[("AutoWork 진단 패키지", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            bundle_path = export_support_bundle(Path(path))
+            append_execution_history("support_bundle_exported", self.workflow, size_bytes=bundle_path.stat().st_size)
+            self._set_status(f"지원 진단 패키지 저장 완료 · {bundle_path.name}")
+            messagebox.showinfo("지원 패키지 저장 완료", f"민감한 Workflow 단계와 화면 원문을 제외한 진단 패키지를 저장했습니다.\n\n{bundle_path}")
+        except Exception as exc:
+            messagebox.showerror("지원 패키지 저장 실패", str(exc))
 
     def _open_log_folder(self) -> None:
         try:
@@ -1440,6 +1496,10 @@ class AutoWorkAgent(tk.Tk):
                 self.hotkey_listener.stop()
             except Exception:
                 pass
+        try:
+            self._refresh_monitor_view(status_override="closing")
+        except Exception:
+            pass
         self._save_config()
         self.destroy()
 
