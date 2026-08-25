@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ from app.engine import (
     load_prompt_template,
     render_prompt_template,
     write_error_report,
+    write_execution_report,
 )
 
 
@@ -564,6 +566,27 @@ def test_player_pause_and_resume_state():
     assert player.paused is False
 
 
+def test_execution_report_is_privacy_conscious_and_bounded(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "RUN_REPORT_DIR", tmp_path / "app" / "run_reports")
+    workflow = Workflow(name="보고서 작업", steps=[Step(type="key", value="secret")])
+    report_path = write_execution_report(
+        "run/../unsafe", "playback_completed", workflow, start_step=1,
+        last_step=1, duration_seconds=1.23456, policy_profile="standard",
+    )
+    assert report_path is not None and report_path.exists()
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    assert data["run_id"] == "rununsafe"
+    assert data["duration_seconds"] == 1.235
+    assert data["workflow"] == "보고서 작업"
+    assert "secret" not in json.dumps(data, ensure_ascii=False)
+    assert "steps" not in data
+    negative_path = write_execution_report("negative", "playback_failed", workflow, duration_seconds=-5)
+    invalid_path = write_execution_report("invalid", "playback_failed", workflow, duration_seconds="not-a-number")
+    assert json.loads(negative_path.read_text(encoding="utf-8"))["duration_seconds"] == 0.0
+    assert json.loads(invalid_path.read_text(encoding="utf-8"))["duration_seconds"] == 0.0
+
+
 def test_error_report_is_written_locally(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
     monkeypatch.setattr(engine, "WORKFLOW_DIR", tmp_path / "app" / "workflows")
@@ -579,3 +602,16 @@ def test_error_report_is_written_locally(tmp_path: Path, monkeypatch):
     assert report["context"]["component"] == "test"
     assert report["error_type"] == "RuntimeError"
     assert "test failure" in report["error"]
+
+
+def test_execution_report_rotation_and_directory_creation(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "RUN_REPORT_DIR", tmp_path / "app" / "run_reports")
+    monkeypatch.setattr(engine, "MAX_RUN_REPORTS", 2)
+    engine.ensure_app_dirs()
+    assert engine.RUN_REPORT_DIR.is_dir()
+    workflow = Workflow(name="회전 작업")
+    for index in range(3):
+        assert write_execution_report(f"rotation-{index}", "playback_completed", workflow)
+        time.sleep(0.002)
+    assert len(list(engine.RUN_REPORT_DIR.glob("run_*.json"))) == 2

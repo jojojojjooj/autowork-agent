@@ -50,6 +50,7 @@ LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
 CHECKPOINT_PATH = APP_DIR / "execution_checkpoint.json"
 MONITOR_STATE_PATH = APP_DIR / "monitor_state.json"
+RUN_REPORT_DIR = APP_DIR / "run_reports"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WORKFLOW_VERSION = 2
 MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
@@ -57,6 +58,7 @@ MAX_WORKFLOW_STEPS = 10_000
 MAX_TEXT_INPUT_LENGTH = 100_000
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 MAX_HISTORY_RECORDS_ON_ROTATE = 1_000
+MAX_RUN_REPORTS = 100
 MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
@@ -376,6 +378,60 @@ def export_support_bundle(target: Path) -> Path:
         if temporary.exists():
             temporary.unlink()
     return destination
+
+
+def write_execution_report(
+    run_id: str,
+    event: str,
+    workflow: Optional["Workflow"] = None,
+    *,
+    mode: str = "playback",
+    start_step: int = 0,
+    last_step: int = 0,
+    duration_seconds: float = 0.0,
+    error_type: str = "",
+    policy_profile: str = "",
+) -> Optional[Path]:
+    """Write a bounded, privacy-conscious per-run report without workflow inputs."""
+    ensure_app_dirs()
+    safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "", str(run_id))[:40] or "unknown"
+    try:
+        duration = round(max(0.0, float(duration_seconds)), 3)
+    except (TypeError, ValueError):
+        duration = 0.0
+    payload = {
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "run_id": safe_run_id,
+        "event": str(event)[:80],
+        "mode": str(mode)[:40],
+        "workflow": workflow.name[:200] if workflow else "",
+        "step_count": len(workflow.steps) if workflow else 0,
+        "start_step": max(0, int(start_step or 0)),
+        "last_step": max(0, int(last_step or 0)),
+        "duration_seconds": duration,
+        "error_type": str(error_type)[:120],
+        "policy_profile": str(policy_profile)[:80],
+    }
+    report_path = RUN_REPORT_DIR / f"run_{safe_run_id}_{int(time.time() * 1000)}.json"
+    temporary = report_path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, report_path)
+        reports = sorted(RUN_REPORT_DIR.glob("run_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in reports[MAX_RUN_REPORTS:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return report_path
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        append_log(f"실행 리포트 저장 실패: {exc}", "WARNING")
+        return None
 
 
 def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workflow_signature: str = "", mode: str = "playback", error_type: str = "") -> None:
@@ -1239,6 +1295,7 @@ def ensure_app_dirs() -> None:
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_screen_size() -> Optional[tuple[int, int]]:

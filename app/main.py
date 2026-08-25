@@ -33,6 +33,7 @@ from engine import (
     WorkflowPlayer,
     append_log,
     append_execution_history,
+    write_execution_report,
     read_execution_history,
     summarize_execution_history,
     build_monitor_snapshot,
@@ -110,6 +111,7 @@ class AutoWorkAgent(tk.Tk):
         self.step_mode_enabled = False
         self.last_failed_step_index: Optional[int] = None
         self.last_ai_index = 0
+        self.last_ai_run_id = ""
         self.dry_run_enabled = True
         self.capture_on_error_enabled = True
 
@@ -934,25 +936,42 @@ class AutoWorkAgent(tk.Tk):
         try:
             self.player.play(workflow, start_index=start_index)
             failure = self.player.failed or self.player.last_error
+            duration = round(time.monotonic() - started_at, 3)
             if failure is not None:
+                last_step = self.player.failure_index or self.player.current_index
+                report_path = write_execution_report(
+                    run_id, "playback_failed", workflow, mode="playback", start_step=start_index + 1,
+                    last_step=last_step, duration_seconds=duration, error_type=type(failure).__name__,
+                )
                 append_execution_history(
-                    "playback_failed",
-                    workflow,
-                    last_step=self.player.failure_index or self.player.current_index,
-                    error=type(failure).__name__,
-                    run_id=run_id,
-                    duration_seconds=round(time.monotonic() - started_at, 3),
+                    "playback_failed", workflow, last_step=last_step, error=type(failure).__name__,
+                    run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "",
                 )
             else:
                 event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
-                append_execution_history(event, workflow, last_step=self.player.current_index, run_id=run_id, duration_seconds=round(time.monotonic() - started_at, 3))
+                report_path = write_execution_report(
+                    run_id, event, workflow, mode="playback", start_step=start_index + 1,
+                    last_step=self.player.current_index, duration_seconds=duration,
+                )
+                append_execution_history(
+                    event, workflow, last_step=self.player.current_index, run_id=run_id,
+                    duration_seconds=duration, report_path=str(report_path) if report_path else "",
+                )
                 clear_execution_checkpoint()
                 self._pending_checkpoint = None
                 self.last_failed_step_index = None
                 self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
                 self.after(0, lambda: self.recover_checkpoint_button.configure(state="disabled"))
         except Exception as exc:
-            append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__, run_id=run_id, duration_seconds=round(time.monotonic() - started_at, 3))
+            duration = round(time.monotonic() - started_at, 3)
+            report_path = write_execution_report(
+                run_id, "playback_failed", workflow, mode="playback", start_step=start_index + 1,
+                last_step=self.player.current_index, duration_seconds=duration, error_type=type(exc).__name__,
+            )
+            append_execution_history(
+                "playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__,
+                run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "",
+            )
             save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
             self._pending_checkpoint = load_execution_checkpoint()
             report_path = self._handle_exception("작업 재생", exc)
@@ -1111,6 +1130,12 @@ class AutoWorkAgent(tk.Tk):
         if not self._ai_job_lock.acquire(blocking=False):
             messagebox.showwarning("AI 실행 중", "현재 AI 계획 작업이 이미 진행 중입니다.")
             return
+        self.last_ai_run_id = secrets.token_hex(8)
+        append_execution_history(
+            "ai_plan_started", self.workflow, run_id=self.last_ai_run_id,
+            plan_steps=len(steps), policy_profile=self._current_policy_profile(),
+            dry_run=bool(self.dry_run_enabled),
+        )
         self.ai_running = True
         self.execute_plan_button.configure(state="disabled")
         self._set_status("화면 관찰 및 로컬 AI 계획 생성 중…")
@@ -1315,8 +1340,10 @@ class AutoWorkAgent(tk.Tk):
                 raise UserInterventionRequired("사용자가 AI 실행을 중지했습니다.")
 
     def _run_ai_steps(self, steps: list[dict[str, Any]]) -> None:
+        started_at = time.monotonic()
         stopped = False
         failed_step: Dict[str, Any] = {}
+        run_error_type = ""
         outcome = "ai_plan_failed"
         try:
             if pyautogui is None:
@@ -1366,10 +1393,24 @@ class AutoWorkAgent(tk.Tk):
             outcome = "ai_plan_stopped" if stopped else ("ai_plan_dry_run_completed" if self.dry_run_enabled else "ai_plan_completed")
             self._set_status("AI 계획 사용자 중지" if stopped else ("AI 계획 검증 완료(dry-run)" if self.dry_run_enabled else "AI 계획 실행 완료"))
         except Exception as exc:
+            run_error_type = type(exc).__name__
             report_path = self._handle_exception("AI 계획 실행", exc, {"failed_step": self.last_ai_index, "step": failed_step})
             self.after(0, lambda: self._show_exception_dialog("AI 계획 실행", exc, report_path))
         finally:
-            append_execution_history(outcome, self.workflow, last_step=self.last_ai_index, dry_run=bool(self.dry_run_enabled))
+            duration = round(time.monotonic() - started_at, 3)
+            run_id = self.last_ai_run_id or secrets.token_hex(8)
+            self.last_ai_run_id = run_id
+            report_path = write_execution_report(
+                run_id, outcome, self.workflow,
+                mode="ai_plan", start_step=1, last_step=self.last_ai_index,
+                duration_seconds=duration, error_type=run_error_type,
+                policy_profile=self._current_policy_profile(),
+            )
+            append_execution_history(
+                outcome, self.workflow, last_step=self.last_ai_index,
+                dry_run=bool(self.dry_run_enabled), run_id=run_id,
+                duration_seconds=duration, report_path=str(report_path) if report_path else "",
+            )
             self.ai_running = False
             self._ai_job_lock.release()
             self.after(0, lambda: self.execute_plan_button.configure(state="normal"))
