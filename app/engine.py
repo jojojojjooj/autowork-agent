@@ -40,6 +40,10 @@ DEBUG_DIR = APP_DIR / "debug_snapshots"
 LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+WORKFLOW_VERSION = 2
+MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
+MAX_WORKFLOW_STEPS = 10_000
+MAX_TEXT_INPUT_LENGTH = 100_000
 _LOG_LOCK = threading.Lock()
 
 
@@ -77,16 +81,41 @@ def write_error_report(context: Dict[str, Any], exc: BaseException, capture_scre
 
 
 def validate_local_endpoint(endpoint: str) -> str:
-    """Allow only a local loopback OpenAI-compatible endpoint."""
+    """Allow only a loopback OpenAI-compatible endpoint rooted at ``/v1``."""
     candidate = (endpoint or "").strip()
+    if not candidate:
+        raise ValueError("로컬 LLM 주소를 입력하세요.")
     if "://" not in candidate:
         candidate = "http://" + candidate
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in LOCAL_HOSTS:
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or hostname not in LOCAL_HOSTS:
         raise ValueError("보안 설정상 로컬 LLM 주소만 허용됩니다. 예: http://127.0.0.1:11434/v1")
     if parsed.username or parsed.password:
         raise ValueError("로컬 LLM 주소에 사용자명·비밀번호를 넣을 수 없습니다.")
-    return candidate.rstrip("/")
+    if parsed.query or parsed.fragment:
+        raise ValueError("로컬 LLM 주소에는 query string이나 fragment를 넣을 수 없습니다.")
+    try:
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError("포트 번호는 1~65535 범위여야 합니다.")
+    except ValueError as exc:
+        raise ValueError("로컬 LLM 주소의 포트가 올바르지 않습니다.") from exc
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/v1"}:
+        raise ValueError("로컬 LLM 주소의 경로는 /v1만 허용됩니다.")
+    netloc = parsed.netloc
+    return f"{parsed.scheme}://{netloc}/v1"
+
+
+def validate_timeout(value: Any) -> int:
+    """Validate a bounded request timeout used for the local model."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("응답 제한 시간은 정수여야 합니다.") from exc
+    if not 5 <= timeout <= 600:
+        raise ValueError("응답 제한 시간은 5~600초 범위여야 합니다.")
+    return timeout
 
 
 class ObservedElement(BaseModel):
@@ -161,24 +190,56 @@ class Workflow:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "version": 1,
-            "name": self.name,
-            "description": self.description,
+            "version": WORKFLOW_VERSION,
+            "name": self.name[:200],
+            "description": self.description[:2000],
             "steps": [asdict(step) for step in self.steps],
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Workflow":
-        steps = []
-        for raw in data.get("steps", []):
-            if not isinstance(raw, dict) or "type" not in raw:
-                continue
-            steps.append(Step(**{key: raw.get(key) for key in Step.__dataclass_fields__}))
-        return cls(
-            name=str(data.get("name", "불러온 작업")),
-            description=str(data.get("description", "")),
-            steps=steps,
-        )
+        if not isinstance(data, dict):
+            raise ValueError("작업 파일의 최상위 형식은 JSON 객체여야 합니다.")
+        version = data.get("version", 1)
+        if version not in {1, WORKFLOW_VERSION}:
+            raise ValueError(f"지원하지 않는 작업 파일 버전입니다: {version}")
+        raw_steps = data.get("steps", [])
+        if not isinstance(raw_steps, list):
+            raise ValueError("작업 단계는 배열이어야 합니다.")
+        if len(raw_steps) > MAX_WORKFLOW_STEPS:
+            raise ValueError(f"작업 단계는 최대 {MAX_WORKFLOW_STEPS:,}개까지 허용됩니다.")
+        steps: List[Step] = []
+        allowed_types = {"click", "key", "wait"}
+        allowed_buttons = {"left", "right", "middle", "x1", "x2"}
+        for index, raw in enumerate(raw_steps, start=1):
+            if not isinstance(raw, dict) or raw.get("type") not in allowed_types:
+                raise ValueError(f"{index}번째 단계의 동작 유형이 올바르지 않습니다.")
+            try:
+                step = Step(**{key: raw.get(key) for key in Step.__dataclass_fields__})
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{index}번째 단계의 형식이 올바르지 않습니다.") from exc
+            if not 0 <= float(step.delay) <= 60:
+                raise ValueError(f"{index}번째 단계의 대기 시간은 0~60초여야 합니다.")
+            if step.type == "click":
+                if step.x is None or step.y is None or not (-100_000 <= int(step.x) <= 100_000) or not (-100_000 <= int(step.y) <= 100_000):
+                    raise ValueError(f"{index}번째 클릭 좌표가 올바르지 않습니다.")
+                if step.button not in allowed_buttons:
+                    raise ValueError(f"{index}번째 마우스 버튼이 올바르지 않습니다.")
+            elif step.type == "key":
+                if step.event not in {"down", "up"} or step.kind not in {"char", "special"} or not step.value or len(step.value) > 32:
+                    raise ValueError(f"{index}번째 키 입력 형식이 올바르지 않습니다.")
+            elif step.type == "wait":
+                try:
+                    if not 0 <= float(step.value or 0) <= 60:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{index}번째 대기 단계의 시간이 올바르지 않습니다.") from exc
+            steps.append(step)
+        name = data.get("name", "불러온 작업")
+        description = data.get("description", "")
+        if not isinstance(name, str) or not isinstance(description, str):
+            raise ValueError("작업 이름과 설명은 문자열이어야 합니다.")
+        return cls(name=name[:200] or "불러온 작업", description=description[:2000], steps=steps)
 
 
 class InputRecorder:
@@ -289,16 +350,47 @@ class WorkflowPlayer:
         self.on_status = on_status
         self.on_error = on_error
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
         self.running = False
         self.current_index = 0
         self.current_step: Optional[Step] = None
         self._pressed_keys: set[str] = set()
 
+    @property
+    def paused(self) -> bool:
+        return self.pause_event.is_set()
+
     def stop(self) -> None:
         self.stop_event.set()
+        self.pause_event.clear()
+
+    def pause(self) -> None:
+        if self.running:
+            self.pause_event.set()
+            if self.on_status:
+                self.on_status("재생 일시정지")
+
+    def resume(self) -> None:
+        self.pause_event.clear()
+        if self.running and self.on_status:
+            self.on_status("재생 재개")
 
     def _sleep(self, seconds: float) -> bool:
-        return not self.stop_event.wait(max(0.0, min(float(seconds), 60.0)))
+        remaining = max(0.0, min(float(seconds), 60.0))
+        while remaining > 0:
+            if self.stop_event.is_set():
+                return False
+            if self.pause_event.is_set():
+                if self.stop_event.wait(0.1):
+                    return False
+                continue
+            chunk = min(remaining, 0.1)
+            started = time.monotonic()
+            if self.stop_event.wait(chunk):
+                return False
+            if not self.pause_event.is_set():
+                remaining -= min(chunk, max(0.0, time.monotonic() - started))
+        return not self.stop_event.is_set()
 
     @staticmethod
     def _paste(text: str) -> None:
@@ -356,6 +448,7 @@ class WorkflowPlayer:
         if pyautogui is None:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
         self.stop_event.clear()
+        self.pause_event.clear()
         self.running = True
         try:
             pyautogui.PAUSE = 0.03
@@ -397,16 +490,6 @@ def ensure_app_dirs() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ERROR_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def save_workflow(workflow: Workflow, path: Path) -> None:
-    ensure_app_dirs()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_workflow(path: Path) -> Workflow:
-    return Workflow.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
 def capture_observation() -> Dict[str, Any]:
@@ -489,8 +572,10 @@ class LocalAIClient:
 
     def __init__(self, endpoint: str = "http://127.0.0.1:11434/v1", model: str = "gemma4:e2b", timeout: int = 120, vision: bool = False):
         self.endpoint = validate_local_endpoint(endpoint)
-        self.model = model
-        self.timeout = timeout
+        self.model = (model or "").strip()
+        if not self.model or len(self.model) > 200:
+            raise ValueError("로컬 AI 모델 이름을 입력하세요(최대 200자).")
+        self.timeout = validate_timeout(timeout)
         self.vision = vision
 
     @staticmethod
@@ -533,6 +618,11 @@ class LocalAIClient:
     def make_plan(self, goal: str, observation: Dict[str, Any]) -> Dict[str, Any]:
         import requests
 
+        goal = (goal or "").strip()
+        if not goal:
+            raise ValueError("업무 목표를 입력하세요.")
+        if len(goal) > 4000:
+            raise ValueError("업무 목표는 최대 4,000자까지 입력할 수 있습니다.")
         system = (
             "당신은 Windows 데스크톱 업무 자동화의 계획기입니다. "
             "반드시 관찰 JSON의 elements에 실제로 존재하는 element_id만 사용하십시오. "
@@ -567,17 +657,50 @@ class LocalAIClient:
                 "json_schema": {"name": "automation_plan", "strict": True, "schema": schema},
             },
         }
-        response = requests.post(f"{self.endpoint}/chat/completions", json=payload, timeout=self.timeout)
-        if response.status_code == 400:
-            # 일부 로컬 서버는 response_format을 아직 지원하지 않으므로 한 번만 호환 모드로 재시도합니다.
-            payload.pop("response_format", None)
+        try:
             response = requests.post(f"{self.endpoint}/chat/completions", json=payload, timeout=self.timeout)
-        response.raise_for_status()
+            if response.status_code == 400:
+                # 일부 로컬 서버는 response_format을 아직 지원하지 않으므로 한 번만 호환 모드로 재시도합니다.
+                payload.pop("response_format", None)
+                response = requests.post(f"{self.endpoint}/chat/completions", json=payload, timeout=self.timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            detail = getattr(getattr(exc, "response", None), "text", "")[:500]
+            raise RuntimeError(f"로컬 AI 요청에 실패했습니다: {exc}{(' · ' + detail) if detail else ''}") from exc
         raw = self._parse_json(self._extract_content(response.json()))
         try:
             return AutomationPlan.model_validate(raw).model_dump(mode="json")
         except ValidationError as exc:
             raise RetryableAutomationError(f"Gemma 구조화 계획 검증 실패: {exc}") from exc
+
+
+def save_workflow(workflow: Workflow, path: Path) -> None:
+    ensure_app_dirs()
+    if not isinstance(workflow, Workflow):
+        raise TypeError("Workflow 객체만 저장할 수 있습니다.")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2)
+    if len(payload.encode("utf-8")) > MAX_WORKFLOW_FILE_BYTES:
+        raise ValueError("작업 파일이 너무 큽니다.")
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_workflow(path: Path) -> Workflow:
+    path = Path(path)
+    if path.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
+        raise ValueError("작업 파일이 너무 큽니다.")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"작업 파일을 읽을 수 없습니다: {exc}") from exc
+    return Workflow.from_dict(data)
 
 
 def validate_ai_steps(
@@ -597,7 +720,15 @@ def validate_ai_steps(
     except ValidationError as exc:
         return False, f"화면 요소 형식 오류: {exc.errors()[0].get('msg', str(exc))}"
     element_map = {element.id: element for element in elements}
-    width, height = screen_size or tuple(observation.get("screen_size", [100000, 100000]))
+    raw_size = screen_size or observation.get("screen_size", [])
+    if not isinstance(raw_size, (list, tuple)) or len(raw_size) != 2:
+        return False, "화면 크기 정보가 올바르지 않습니다. 화면을 다시 관찰하세요."
+    try:
+        width, height = int(raw_size[0]), int(raw_size[1])
+    except (TypeError, ValueError):
+        return False, "화면 크기 정보가 올바르지 않습니다. 화면을 다시 관찰하세요."
+    if width <= 0 or height <= 0:
+        return False, "화면 크기가 올바르지 않습니다. 화면을 다시 관찰하세요."
     safe_hotkeys = {"ctrl", "shift", "alt", "win", "enter", "esc", "tab", "space", "backspace", "delete", "home", "end", "left", "right", "up", "down"}
     dangerous = {("alt", "f4"), ("ctrl", "shift", "delete")}
     for index, action in enumerate(parsed.steps, start=1):
@@ -617,14 +748,19 @@ def validate_ai_steps(
                 return False, f"{index}번째 단계의 UI 요소 영역이 유효하지 않습니다."
             if not (0 <= element.bbox[0] < width and 0 < element.bbox[2] <= width and 0 <= element.bbox[1] < height and 0 < element.bbox[3] <= height):
                 return False, f"{index}번째 UI 요소가 화면 밖입니다."
-        if action.action == "type" and not action.text:
-            return False, f"{index}번째 입력값이 없습니다."
+        if action.action == "type":
+            if not action.text:
+                return False, f"{index}번째 입력값이 없습니다."
+            if len(action.text) > MAX_TEXT_INPUT_LENGTH:
+                return False, f"{index}번째 입력값이 너무 깁니다(최대 {MAX_TEXT_INPUT_LENGTH:,}자)."
         if action.action == "hotkey":
             keys = tuple(key.lower() for key in action.keys)
-            if not keys or any(key not in safe_hotkeys and not re.fullmatch(r"f([1-9]|1[0-2])", key) for key in keys):
+            if not 1 <= len(keys) <= 4 or any(key not in safe_hotkeys and not re.fullmatch(r"f([1-9]|1[0-2])", key) for key in keys):
                 return False, f"{index}번째 단축키가 허용되지 않습니다."
-            if keys in dangerous:
+            if set(keys) == {"alt", "f4"} or set(keys) == {"ctrl", "shift", "delete"}:
                 return False, f"{index}번째 위험 단축키는 자동 실행하지 않습니다."
+        if action.action == "scroll" and action.amount == 0:
+            return False, f"{index}번째 스크롤 양이 없습니다."
         if action.action == "wait" and not 0 <= action.seconds <= 60:
             return False, f"{index}번째 대기 시간이 허용 범위를 벗어났습니다."
         if action.risk in {"submit", "delete", "unknown"} and not action.requires_confirmation:

@@ -1,8 +1,21 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from app import engine
-from app.engine import Step, Workflow, LocalAIClient, load_workflow, save_workflow, validate_ai_steps, validate_local_endpoint, write_error_report
+from app.engine import (
+    LocalAIClient,
+    Step,
+    Workflow,
+    WorkflowPlayer,
+    load_workflow,
+    save_workflow,
+    validate_ai_steps,
+    validate_local_endpoint,
+    validate_timeout,
+    write_error_report,
+)
 
 
 def test_workflow_roundtrip(tmp_path: Path):
@@ -78,6 +91,59 @@ def test_local_endpoint_allows_loopback_only():
         assert "로컬 LLM" in str(exc)
     else:
         raise AssertionError("외부 endpoint가 허용되었습니다.")
+
+
+def test_workflow_is_saved_as_version_2_and_rejects_unsafe_steps(tmp_path: Path):
+    path = tmp_path / "workflow.json"
+    save_workflow(Workflow(steps=[Step(type="wait", value="1")]), path)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["version"] == 2
+    assert load_workflow(path).steps[0].value == "1"
+
+    with pytest.raises(ValueError, match="동작 유형"):
+        Workflow.from_dict({"version": 2, "steps": [{"type": "shell"}]})
+
+
+def test_local_endpoint_and_timeout_are_strictly_bounded():
+    assert validate_local_endpoint("localhost:1234/v1/") == "http://localhost:1234/v1"
+    with pytest.raises(ValueError):
+        validate_local_endpoint("http://127.0.0.1:11434/v1?token=secret")
+    with pytest.raises(ValueError):
+        validate_local_endpoint("http://127.0.0.1:11434/other")
+    assert validate_timeout("30") == 30
+    with pytest.raises(ValueError):
+        validate_timeout("601")
+
+
+def test_ai_plan_rejects_zero_scroll_and_oversized_text():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [{"id": "uia_0001", "role": "edit", "bbox": [10, 20, 110, 60], "enabled": True, "visible": True}],
+    }
+    valid, message = validate_ai_steps(
+        {"steps": [{"action": "scroll", "amount": 0, "confidence": 0.9}]},
+        (1920, 1080), observation,
+    )
+    assert valid is False
+    assert "스크롤 양" in message
+    valid, message = validate_ai_steps(
+        {"steps": [{"action": "type", "element_id": "uia_0001", "text": "x" * 100_001, "confidence": 0.9}]},
+        (1920, 1080), observation,
+    )
+    assert valid is False
+    assert "너무 깁니다" in message
+
+
+def test_player_pause_and_resume_state():
+    player = WorkflowPlayer()
+    assert player.paused is False
+    player.running = True
+    player.pause()
+    assert player.paused is True
+    player.resume()
+    assert player.paused is False
+    player.stop()
+    assert player.paused is False
 
 
 def test_error_report_is_written_locally(tmp_path: Path, monkeypatch):

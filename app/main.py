@@ -31,6 +31,8 @@ from engine import (
     load_workflow,
     save_workflow,
     validate_ai_steps,
+    validate_local_endpoint,
+    validate_timeout,
 )
 
 try:
@@ -126,6 +128,8 @@ class AutoWorkAgent(tk.Tk):
         self.stop_record_button = ttk.Button(top, text="■ 기록 중지", command=self._stop_recording, state="disabled")
         self.stop_record_button.pack(side="left", padx=6)
         ttk.Button(top, text="▶ 재생", command=self._play_workflow, style="Primary.TButton").pack(side="left", padx=(18, 6))
+        self.pause_play_button = ttk.Button(top, text="재생 일시정지", command=self._toggle_pause_playback, state="disabled")
+        self.pause_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="재생 중지", command=self._stop_playback).pack(side="left")
         ttk.Button(top, text="저장", command=self._save_workflow).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="불러오기", command=self._load_workflow).pack(side="right")
@@ -405,8 +409,20 @@ class AutoWorkAgent(tk.Tk):
         self.stop_record_button.configure(state="disabled")
         self._set_status(f"기록 중지 · {len(self.workflow.steps)}개 단계")
 
+    def _toggle_pause_playback(self) -> None:
+        if not self.player.running:
+            return
+        if self.player.paused:
+            self.player.resume()
+            self.pause_play_button.configure(text="재생 일시정지")
+        else:
+            self.player.pause()
+            self.pause_play_button.configure(text="재생 재개")
+
     def _stop_playback(self) -> None:
         self.player.stop()
+        if hasattr(self, "pause_play_button"):
+            self.pause_play_button.configure(state="disabled", text="재생 일시정지")
         self._set_status("재생 중지 요청")
 
     def _stop_ai_plan(self) -> None:
@@ -429,7 +445,14 @@ class AutoWorkAgent(tk.Tk):
         )
         if not ok:
             return
-        threading.Thread(target=self.player.play, args=(self.workflow,), daemon=True).start()
+        self.pause_play_button.configure(state="normal", text="재생 일시정지")
+        threading.Thread(target=self._play_workflow_worker, daemon=True).start()
+
+    def _play_workflow_worker(self) -> None:
+        try:
+            self.player.play(self.workflow)
+        finally:
+            self.after(0, lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
 
     def _save_workflow(self) -> None:
         self.workflow.name = self.workflow_name_var.get().strip() or "새 작업"
@@ -473,12 +496,18 @@ class AutoWorkAgent(tk.Tk):
         if not goal:
             messagebox.showinfo("업무 목표 필요", "AI에게 시킬 업무 목표를 입력하세요.")
             return
-        settings = {
-            "endpoint": self.endpoint_var.get().strip(),
-            "model": self.model_var.get().strip(),
-            "timeout": int(self.timeout_var.get().strip()),
-            "vision": bool(self.vision_var.get()),
-        }
+        try:
+            settings = {
+                "endpoint": validate_local_endpoint(self.endpoint_var.get().strip()),
+                "model": self.model_var.get().strip(),
+                "timeout": validate_timeout(self.timeout_var.get().strip()),
+                "vision": bool(self.vision_var.get()),
+            }
+            if not settings["model"]:
+                raise ValueError("모델 이름을 입력하세요.")
+        except ValueError as exc:
+            messagebox.showerror("설정값 오류", str(exc))
+            return
         self.execute_plan_button.configure(state="disabled")
         self._set_status("화면 관찰 및 로컬 AI 계획 생성 중…")
         threading.Thread(target=self._agent_worker, args=(goal, settings), daemon=True).start()
@@ -707,10 +736,15 @@ class AutoWorkAgent(tk.Tk):
 
     def _save_config(self) -> None:
         try:
+            endpoint = validate_local_endpoint(self.endpoint_var.get().strip())
+            timeout = validate_timeout(self.timeout_var.get().strip())
+            model = self.model_var.get().strip()
+            if not model or len(model) > 200:
+                raise ValueError("모델 이름은 1~200자로 입력하세요.")
             data = {
-                "endpoint": self.endpoint_var.get().strip(),
-                "model": self.model_var.get().strip(),
-                "timeout": int(self.timeout_var.get().strip()),
+                "endpoint": endpoint,
+                "model": model,
+                "timeout": timeout,
                 "vision": bool(self.vision_var.get()),
                 "capture_on_error": bool(self.capture_on_error_var.get()),
                 "dry_run": bool(self.dry_run_var.get()),
