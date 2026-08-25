@@ -34,6 +34,7 @@ from engine import (
     cleanup_expired_artifacts,
     ensure_app_dirs,
     redact_sensitive,
+    inspect_workflow,
     validate_workflow,
     write_error_report,
     load_workflow,
@@ -142,6 +143,7 @@ class AutoWorkAgent(tk.Tk):
         self.pause_play_button = ttk.Button(top, text="재생 일시정지", command=self._toggle_pause_playback, state="disabled")
         self.pause_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="재생 중지", command=self._stop_playback).pack(side="left")
+        ttk.Button(top, text="안전 점검", command=self._inspect_current_workflow).pack(side="left", padx=(12, 0))
         ttk.Button(top, text="템플릿 저장", command=self._save_template).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="템플릿 불러오기", command=self._load_template).pack(side="right")
         ttk.Button(top, text="선택 단계 삭제", command=self._delete_selected_step).pack(side="right", padx=(6, 0))
@@ -461,6 +463,24 @@ class AutoWorkAgent(tk.Tk):
             self.step_tree.selection_set(items[index])
             self.step_tree.focus(items[index])
 
+    def _inspect_current_workflow(self) -> None:
+        report = inspect_workflow(self.workflow, get_screen_size())
+        status = "통과" if report["valid"] else "실패"
+        lines = [
+            f"안전 점검: {status}",
+            f"단계: {report['step_count']}개 · 클릭 {report['click_count']} · 키 {report['key_count']} · 대기 {report['wait_count']}",
+            f"결과: {report['reason']}",
+        ]
+        if report["window_titles"]:
+            lines.append("대상 창: " + ", ".join(report["window_titles"][:5]))
+        if report["warnings"]:
+            lines.append("경고: " + " ".join(report["warnings"]))
+        if report["valid"] and not report["warnings"]:
+            messagebox.showinfo("안전 점검 완료", "\n".join(lines))
+        else:
+            messagebox.showwarning("안전 점검 결과", "\n".join(lines))
+        self._set_status(f"안전 점검 {status}")
+
     def _delete_selected_step(self) -> None:
         if not self._can_edit_steps():
             return
@@ -634,6 +654,7 @@ class AutoWorkAgent(tk.Tk):
                 f"현재 화면: {current_size[0]}×{current_size[1]}\n\n"
                 "좌표 기반 재생의 위치가 달라질 수 있습니다. 그래도 계속하시겠습니까?",
             ):
+                self._playback_launch_lock.release()
                 return
         ok = messagebox.askyesno(
             "재생 확인",

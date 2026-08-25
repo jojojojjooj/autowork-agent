@@ -49,6 +49,7 @@ MAX_WORKFLOW_STEPS = 10_000
 MAX_TEXT_INPUT_LENGTH = 100_000
 MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
+MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
@@ -95,9 +96,35 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
         with _HISTORY_LOCK:
             with HISTORY_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(line)
+        trim_execution_history()
     except OSError as exc:
         # Audit history is useful but must never block the requested automation.
         append_log(f"실행 이력 저장 실패: {exc}", "WARNING")
+
+
+def trim_execution_history(max_bytes: int = MAX_HISTORY_FILE_BYTES) -> None:
+    """Keep only the newest complete JSONL records within a bounded file size."""
+    ensure_app_dirs()
+    try:
+        limit = max(1024, int(max_bytes))
+        with _HISTORY_LOCK:
+            if not HISTORY_PATH.exists() or HISTORY_PATH.stat().st_size <= limit:
+                return
+            lines = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+            kept: List[str] = []
+            total = 0
+            for line in reversed(lines):
+                encoded_size = len((line + "\n").encode("utf-8"))
+                if kept and total + encoded_size > limit:
+                    break
+                kept.append(line)
+                total += encoded_size
+            kept.reverse()
+            temporary = HISTORY_PATH.with_suffix(".tmp")
+            temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            os.replace(temporary, HISTORY_PATH)
+    except (OSError, ValueError) as exc:
+        append_log(f"실행 이력 정리 실패: {exc}", "WARNING")
 
 
 def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
@@ -110,7 +137,12 @@ def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
     if not HISTORY_PATH.exists():
         return []
     records: List[Dict[str, Any]] = []
-    for line in HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-count:]:
+    try:
+        with _HISTORY_LOCK:
+            lines = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-count:]
+    except OSError:
+        return records
+    for line in lines:
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -781,6 +813,28 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
             if not math.isfinite(seconds) or not 0 <= seconds <= 60:
                 return False, f"{index}번째 대기 시간이 허용 범위를 벗어났습니다."
     return True, "검증 완료"
+
+
+def inspect_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> Dict[str, Any]:
+    """Return a non-destructive safety and readiness report for a workflow."""
+    valid, reason = validate_workflow(workflow, screen_size)
+    steps = list(workflow.steps) if isinstance(workflow, Workflow) else []
+    current_size = tuple(int(value) for value in screen_size) if screen_size else None
+    recorded_size = tuple(workflow.recorded_screen_size) if isinstance(workflow, Workflow) and workflow.recorded_screen_size else None
+    warnings: List[str] = []
+    if recorded_size and current_size and recorded_size != current_size:
+        warnings.append(f"기록 화면 {recorded_size[0]}×{recorded_size[1]}와 현재 화면 {current_size[0]}×{current_size[1]}이 다릅니다.")
+    window_titles = list(dict.fromkeys(step.window_title.strip() for step in steps if (step.window_title or "").strip()))
+    return {
+        "valid": valid,
+        "reason": reason,
+        "step_count": len(steps),
+        "click_count": sum(step.type == "click" for step in steps),
+        "key_count": sum(step.type == "key" for step in steps),
+        "wait_count": sum(step.type == "wait" for step in steps),
+        "window_titles": window_titles,
+        "warnings": warnings,
+    }
 
 
 def cleanup_expired_artifacts(max_age_days: int = MAX_CAPTURE_AGE_DAYS) -> None:
