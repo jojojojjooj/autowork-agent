@@ -44,6 +44,9 @@ from app.engine import (
     save_prompt_template,
     load_prompt_template,
     render_prompt_template,
+    list_prompt_template_versions,
+    compare_prompt_templates,
+    compare_prompt_template_versions,
     write_error_report,
     write_execution_report,
 )
@@ -267,6 +270,44 @@ def test_prompt_template_roundtrip_and_fail_closed(tmp_path: Path):
     assert render_prompt_template(data["goal_template"], {"month": "3월", "target": "문서함"}) == "3월 보고서를 문서함에서 확인해 줘"
     with pytest.raises(ValueError):
         render_prompt_template(data["goal_template"], {"month": "3월"})
+
+
+def test_prompt_template_versions_and_metadata_comparison(tmp_path: Path, monkeypatch):
+    path = tmp_path / "prompt.json"
+    first = save_prompt_template(path, "업무 템플릿", "{{month}} 문서를 확인", "standard", [])
+    assert first["revision"] == 1
+    unchanged = save_prompt_template(path, "업무 템플릿", "{{month}} 문서를 확인", "standard", [])
+    assert unchanged["revision"] == 1
+    second = save_prompt_template(path, "업무 템플릿", "{{month}} 문서를 검토", "browser", [])
+    assert second["revision"] == 2
+    assert (tmp_path / ".prompt.versions" / "v0001.json").exists()
+    versions = list_prompt_template_versions(path)
+    assert [item["revision"] for item in versions] == [2, 1]
+    comparison = compare_prompt_template_versions(path, 1, 2)
+    assert comparison["same"] is False
+    assert "goal_template" in comparison["changed_fields"]
+    assert "policy_profile" in comparison["changed_fields"]
+    serialized = json.dumps(comparison, ensure_ascii=False)
+    assert "{{month}} 문서를 확인" not in serialized
+    assert "{{month}} 문서를 검토" not in serialized
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["goal_template"] = "변조된 목표"
+    path.write_text(json.dumps(tampered, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint"):
+        load_prompt_template(path)
+
+
+def test_prompt_template_file_comparison_omits_bodies(tmp_path: Path):
+    left_path = tmp_path / "left.json"
+    right_path = tmp_path / "right.json"
+    save_prompt_template(left_path, "왼쪽", "왼쪽 목표 {{month}}", "standard", [])
+    save_prompt_template(right_path, "오른쪽", "오른쪽 목표 {{month}}", "browser", [])
+    comparison = compare_prompt_templates(left_path, right_path)
+    assert comparison["same"] is False
+    assert set(comparison["changed_fields"]) == {"name", "goal_template", "policy_profile"}
+    serialized = json.dumps(comparison, ensure_ascii=False)
+    assert "왼쪽 목표" not in serialized
+    assert "오른쪽 목표" not in serialized
 
 
 def test_ai_plan_validation():

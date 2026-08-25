@@ -1597,18 +1597,76 @@ def save_workflow(workflow: Workflow, path: Path) -> Optional[Path]:
 
 PROMPT_TEMPLATE_VERSION = 1
 MAX_PROMPT_TEMPLATE_LENGTH = 4_000
+MAX_PROMPT_TEMPLATE_VERSIONS = 20
 
 
-def save_prompt_template(path: Path, name: str, goal_template: str, policy_profile: str = "standard", document_roots: list[str] | None = None) -> None:
-    """Persist a parameterized natural-language task template locally and atomically."""
+def _prompt_template_fingerprint(data: Dict[str, Any]) -> str:
+    """Hash only normalized template semantics, excluding timestamps and revision metadata."""
+    normalized = {
+        "version": PROMPT_TEMPLATE_VERSION,
+        "name": str(data.get("name", ""))[:200],
+        "goal_template": str(data.get("goal_template", ""))[:MAX_PROMPT_TEMPLATE_LENGTH],
+        "placeholders": list(data.get("placeholders", []))[:30],
+        "policy_profile": str(data.get("policy_profile", "standard"))[:80],
+        "document_roots": list(data.get("document_roots", []))[:5],
+    }
+    return hashlib.sha256(json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _prompt_template_history_dir(path: Path) -> Path:
+    target = Path(path)
+    return target.parent / f".{target.stem}.versions"
+
+
+def _prompt_template_revision(data: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(data.get("revision", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def save_prompt_template(path: Path, name: str, goal_template: str, policy_profile: str = "standard", document_roots: list[str] | None = None) -> Dict[str, Any]:
+    """Persist a versioned natural-language task template locally and atomically."""
     title = (name or "자연어 작업 템플릿").strip()[:200]
     template = (goal_template or "").strip()
     if not template or len(template) > MAX_PROMPT_TEMPLATE_LENGTH:
         raise ValueError(f"자연어 템플릿은 1~{MAX_PROMPT_TEMPLATE_LENGTH:,}자여야 합니다.")
     placeholders = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", template)))[:30]
-    payload = {"version": PROMPT_TEMPLATE_VERSION, "name": title, "goal_template": template, "placeholders": placeholders, "policy_profile": policy_profile or "standard", "document_roots": [str(item)[:500] for item in (document_roots or [])[:5]]}
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "version": PROMPT_TEMPLATE_VERSION,
+        "name": title,
+        "goal_template": template,
+        "placeholders": placeholders,
+        "policy_profile": policy_profile or "standard",
+        "document_roots": [str(item)[:500] for item in (document_roots or [])[:5]],
+    }
+    payload["fingerprint"] = _prompt_template_fingerprint(payload)
+    previous: Optional[Dict[str, Any]] = None
+    if target.exists():
+        try:
+            previous = load_prompt_template(target)
+        except (OSError, ValueError):
+            previous = None
+    if previous and previous.get("fingerprint") == payload["fingerprint"]:
+        payload["revision"] = _prompt_template_revision(previous)
+    else:
+        previous_revision = _prompt_template_revision(previous or {})
+        payload["revision"] = previous_revision + 1 if previous else 1
+        if previous:
+            history_dir = _prompt_template_history_dir(target)
+            history_dir.mkdir(parents=True, exist_ok=True)
+            archive = history_dir / f"v{previous_revision:04d}.json"
+            if not archive.exists():
+                archive.write_text(json.dumps(previous, ensure_ascii=False, indent=2), encoding="utf-8")
+            archives = sorted(history_dir.glob("v[0-9][0-9][0-9][0-9].json"), key=lambda item: item.name, reverse=True)
+            for stale in archives[MAX_PROMPT_TEMPLATE_VERSIONS:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+    payload["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     temporary = target.with_name(f".{target.name}.tmp")
     try:
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1616,6 +1674,7 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
     finally:
         if temporary.exists():
             temporary.unlink()
+    return payload
 
 
 def load_prompt_template(path: Path) -> Dict[str, Any]:
@@ -1632,12 +1691,83 @@ def load_prompt_template(path: Path) -> Dict[str, Any]:
     template = str(data.get("goal_template", "")).strip()
     if not template or len(template) > MAX_PROMPT_TEMPLATE_LENGTH:
         raise ValueError("자연어 템플릿 내용이 올바르지 않습니다.")
+    data["name"] = str(data.get("name", "자연어 작업 템플릿"))[:200]
     data["goal_template"] = template
     data["placeholders"] = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", template)))[:30]
     data["policy_profile"] = str(data.get("policy_profile", "standard"))[:80]
     roots = data.get("document_roots", [])
     data["document_roots"] = [str(item)[:500] for item in roots[:5]] if isinstance(roots, list) else []
+    computed_fingerprint = _prompt_template_fingerprint(data)
+    stored_fingerprint = str(data.get("fingerprint", ""))
+    if stored_fingerprint and not hmac.compare_digest(stored_fingerprint, computed_fingerprint):
+        raise ValueError("자연어 템플릿 fingerprint가 일치하지 않습니다. 파일이 변경되었을 수 있습니다.")
+    data["fingerprint"] = computed_fingerprint
+    data["revision"] = _prompt_template_revision(data)
     return data
+
+
+def _prompt_template_summary(data: Dict[str, Any], is_current: bool = False) -> Dict[str, Any]:
+    return {
+        "revision": _prompt_template_revision(data),
+        "name": str(data.get("name", ""))[:200],
+        "policy_profile": str(data.get("policy_profile", "standard"))[:80],
+        "placeholder_count": len(data.get("placeholders", [])),
+        "fingerprint": str(data.get("fingerprint", ""))[:64],
+        "is_current": bool(is_current),
+    }
+
+
+def list_prompt_template_versions(path: Path) -> list[Dict[str, Any]]:
+    """List local template revision metadata without returning goal text or document roots."""
+    target = Path(path)
+    current = load_prompt_template(target)
+    versions = [_prompt_template_summary(current, is_current=True)]
+    history_dir = _prompt_template_history_dir(target)
+    if history_dir.exists():
+        for archive in sorted(history_dir.glob("v[0-9][0-9][0-9][0-9].json"), reverse=True):
+            try:
+                versions.append(_prompt_template_summary(load_prompt_template(archive)))
+            except (OSError, ValueError):
+                continue
+    return versions[:MAX_PROMPT_TEMPLATE_VERSIONS + 1]
+
+
+def load_prompt_template_version(path: Path, revision: int) -> Dict[str, Any]:
+    """Load one local template revision, failing closed when the revision is absent."""
+    target = Path(path)
+    current = load_prompt_template(target)
+    requested = int(revision)
+    if requested == _prompt_template_revision(current):
+        return current
+    archive = _prompt_template_history_dir(target) / f"v{requested:04d}.json"
+    if not archive.is_file():
+        raise ValueError(f"템플릿 버전 v{requested}을 찾을 수 없습니다.")
+    return load_prompt_template(archive)
+
+
+def _compare_prompt_template_data(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+    changed = []
+    for field_name in ("name", "goal_template", "placeholders", "policy_profile", "document_roots"):
+        if left.get(field_name) != right.get(field_name):
+            changed.append(field_name)
+    return {
+        "same": not changed,
+        "changed_fields": changed,
+        "left": _prompt_template_summary(left),
+        "right": _prompt_template_summary(right),
+    }
+
+
+def compare_prompt_templates(left_path: Path, right_path: Path) -> Dict[str, Any]:
+    """Compare two local templates by metadata and semantic fields without emitting their text."""
+    return _compare_prompt_template_data(load_prompt_template(Path(left_path)), load_prompt_template(Path(right_path)))
+
+
+def compare_prompt_template_versions(path: Path, left_revision: int, right_revision: int) -> Dict[str, Any]:
+    """Compare two revisions of one local template without returning goal text."""
+    left = load_prompt_template_version(path, left_revision)
+    right = load_prompt_template_version(path, right_revision)
+    return _compare_prompt_template_data(left, right)
 
 
 def render_prompt_template(template: str, values: Dict[str, Any]) -> str:

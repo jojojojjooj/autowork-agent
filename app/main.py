@@ -33,6 +33,8 @@ from engine import (
     WorkflowPlayer,
     append_log,
     append_execution_history,
+    compare_prompt_templates,
+    list_prompt_template_versions,
     write_execution_report,
     read_execution_history,
     summarize_execution_history,
@@ -250,6 +252,7 @@ class AutoWorkAgent(tk.Tk):
         goal_actions.pack(fill="x", pady=(8, 0))
         ttk.Button(goal_actions, text="자연어 템플릿 불러오기", command=self._load_prompt_template).pack(side="left")
         ttk.Button(goal_actions, text="자연어 템플릿 저장", command=self._save_prompt_template).pack(side="left", padx=6)
+        ttk.Button(goal_actions, text="템플릿 버전·비교", command=self._compare_prompt_templates).pack(side="left", padx=6)
         ttk.Button(goal_actions, text="화면 관찰 후 계획 생성", command=self._make_ai_plan, style="Primary.TButton").pack(side="right")
 
         body = ttk.Panedwindow(self.ai_tab, orient="horizontal")
@@ -1071,10 +1074,48 @@ class AutoWorkAgent(tk.Tk):
         if not path:
             return
         try:
-            save_prompt_template(Path(path), Path(path).stem, goal_template, self._current_policy_profile(), [str(item) for item in normalize_document_roots(self.document_roots_var.get())])
-            self._set_status(f"자연어 템플릿 저장 완료 · {Path(path).name}")
+            saved = save_prompt_template(Path(path), Path(path).stem, goal_template, self._current_policy_profile(), [str(item) for item in normalize_document_roots(self.document_roots_var.get())])
+            self._set_status(f"자연어 템플릿 저장 완료 · {Path(path).name} · v{saved.get('revision', 1)}")
         except Exception as exc:
             messagebox.showerror("자연어 템플릿 저장 실패", str(exc))
+
+    def _compare_prompt_templates(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="템플릿 버전·비교 대상 선택(1개 또는 2개)",
+            initialdir=str(TEMPLATE_DIR),
+            filetypes=[("자연어 템플릿", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not paths:
+            return
+        try:
+            if len(paths) == 1:
+                versions = list_prompt_template_versions(Path(paths[0]))
+                lines = [f"{Path(paths[0]).name}의 로컬 버전 목록", ""]
+                for item in versions:
+                    marker = "현재" if item.get("is_current") else "보관"
+                    lines.append(
+                        f"v{item.get('revision')} · {marker} · 정책 {item.get('policy_profile')} · "
+                        f"변수 {item.get('placeholder_count')}개 · fingerprint {str(item.get('fingerprint', ''))[:12]}"
+                    )
+                messagebox.showinfo("템플릿 버전 목록", "\n".join(lines))
+                return
+            if len(paths) != 2:
+                messagebox.showwarning("템플릿 선택", "템플릿은 한 번에 1개 또는 2개만 선택하세요.")
+                return
+            comparison = compare_prompt_templates(Path(paths[0]), Path(paths[1]))
+            changed = comparison.get("changed_fields", [])
+            changed_text = ", ".join(changed) if changed else "변경 없음"
+            left = comparison.get("left", {})
+            right = comparison.get("right", {})
+            messagebox.showinfo(
+                "템플릿 비교 결과",
+                f"왼쪽: {Path(paths[0]).name} v{left.get('revision')}\n"
+                f"오른쪽: {Path(paths[1]).name} v{right.get('revision')}\n\n"
+                f"변경 필드: {changed_text}\n"
+                "템플릿 본문은 진단 이력에 기록하지 않습니다.",
+            )
+        except Exception as exc:
+            messagebox.showerror("템플릿 버전·비교 실패", str(exc))
 
     def _load_prompt_template(self) -> None:
         path = filedialog.askopenfilename(
@@ -1133,7 +1174,7 @@ class AutoWorkAgent(tk.Tk):
         self.last_ai_run_id = secrets.token_hex(8)
         append_execution_history(
             "ai_plan_started", self.workflow, run_id=self.last_ai_run_id,
-            plan_steps=len(steps), policy_profile=self._current_policy_profile(),
+            plan_steps=0, policy_profile=self._current_policy_profile(),
             dry_run=bool(self.dry_run_enabled),
         )
         self.ai_running = True
