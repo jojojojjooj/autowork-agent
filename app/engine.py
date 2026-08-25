@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from urllib.parse import urlparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
 
@@ -37,6 +37,8 @@ WORKFLOW_DIR = APP_DIR / "workflows"
 CACHE_DIR = APP_DIR / "cache"
 ERROR_DIR = APP_DIR / "errors"
 DEBUG_DIR = APP_DIR / "debug_snapshots"
+TEMPLATE_DIR = APP_DIR / "templates"
+HISTORY_PATH = APP_DIR / "execution_history.jsonl"
 LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -45,6 +47,7 @@ MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
 MAX_WORKFLOW_STEPS = 10_000
 MAX_TEXT_INPUT_LENGTH = 100_000
 _LOG_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.Lock()
 
 
 def append_log(message: str, level: str = "INFO") -> None:
@@ -54,6 +57,48 @@ def append_log(message: str, level: str = "INFO") -> None:
     with _LOG_LOCK:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(line)
+
+
+def append_execution_history(event: str, workflow: Optional["Workflow"] = None, **details: Any) -> None:
+    """Append a privacy-conscious execution event to a local JSONL file."""
+    ensure_app_dirs()
+    record: Dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": str(event)[:80],
+        "workflow": workflow.name[:200] if workflow else "",
+        "step_count": len(workflow.steps) if workflow else 0,
+    }
+    for key, value in details.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            record[str(key)[:80]] = value
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        with _HISTORY_LOCK:
+            with HISTORY_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+    except OSError as exc:
+        # Audit history is useful but must never block the requested automation.
+        append_log(f"실행 이력 저장 실패: {exc}", "WARNING")
+
+
+def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
+    """Read the newest local execution events without exposing input contents."""
+    ensure_app_dirs()
+    try:
+        count = max(1, min(int(limit), 2_000))
+    except (TypeError, ValueError):
+        count = 200
+    if not HISTORY_PATH.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-count:]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
 
 
 def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None) -> Path:
@@ -180,6 +225,10 @@ class Step:
     event: Optional[str] = None
     kind: Optional[str] = None
     value: Optional[str] = None
+    uia_automation_id: Optional[str] = None
+    uia_name: Optional[str] = None
+    uia_control_type: Optional[str] = None
+    window_title: Optional[str] = None
 
 
 @dataclass
@@ -236,6 +285,10 @@ class Workflow:
                         raise ValueError
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{index}번째 대기 단계의 시간이 올바르지 않습니다.") from exc
+            for field_name in ("uia_automation_id", "uia_name", "uia_control_type", "window_title"):
+                value = getattr(step, field_name)
+                if value is not None and (not isinstance(value, str) or len(value) > 256):
+                    raise ValueError(f"{index}번째 UI Automation 식별자가 올바르지 않습니다.")
             steps.append(step)
         name = data.get("name", "불러온 작업")
         description = data.get("description", "")
@@ -263,6 +316,76 @@ class Workflow:
         if not 0 <= index < len(self.steps):
             raise IndexError("삭제할 작업 단계가 없습니다.")
         return self.steps.pop(index)
+
+    def move_step(self, index: int, offset: int) -> None:
+        """Move one step by an offset, keeping the workflow order valid."""
+        if not 0 <= index < len(self.steps):
+            raise IndexError("이동할 작업 단계가 없습니다.")
+        target = index + offset
+        if not 0 <= target < len(self.steps):
+            raise IndexError("작업 단계를 더 이동할 수 없습니다.")
+        self.steps[index], self.steps[target] = self.steps[target], self.steps[index]
+
+    def duplicate_step(self, index: int) -> Step:
+        """Insert a copy immediately after one step and return the copy."""
+        if not 0 <= index < len(self.steps):
+            raise IndexError("복제할 작업 단계가 없습니다.")
+        copied = replace(self.steps[index])
+        self.steps.insert(index + 1, copied)
+        return copied
+
+    def update_step_delay(self, index: int, delay: float) -> None:
+        """Update one step delay within the same bounds used by file validation."""
+        if not 0 <= index < len(self.steps):
+            raise IndexError("수정할 작업 단계가 없습니다.")
+        try:
+            value = float(delay)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("대기 시간은 숫자여야 합니다.") from exc
+        if not 0 <= value <= 60:
+            raise ValueError("대기 시간은 0~60초 범위여야 합니다.")
+        self.steps[index].delay = round(value, 3)
+
+
+def get_active_window_title() -> str:
+    """Return the foreground window title when Windows UI Automation is available."""
+    try:
+        from pywinauto import Desktop
+        return str(Desktop(backend="uia").get_active().window_text() or "")[:512]
+    except Exception:
+        return ""
+
+
+def get_uia_metadata_at_point(x: int, y: int) -> Dict[str, str]:
+    """Best-effort metadata lookup for a recorded click point."""
+    try:
+        from pywinauto import Desktop
+        active = Desktop(backend="uia").get_active()
+        candidates: List[tuple[int, Dict[str, str]]] = []
+        for control in active.descendants()[:200]:
+            try:
+                rect = control.rectangle()
+                if not (rect.left <= x <= rect.right and rect.top <= y <= rect.bottom):
+                    continue
+                info = control.element_info
+                name = str(control.window_text() or "")[:256]
+                control_type = str(getattr(info, "control_type", "") or "")[:128]
+                automation_id = str(getattr(info, "automation_id", "") or "")[:256]
+                if automation_id or name or control_type:
+                    area = max(1, int(rect.right - rect.left) * int(rect.bottom - rect.top))
+                    candidates.append((area, {
+                        "uia_automation_id": automation_id or None,
+                        "uia_name": name or None,
+                        "uia_control_type": control_type or None,
+                    }))
+            except Exception:
+                continue
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+    except Exception:
+        pass
+    return {}
 
 
 class InputRecorder:
@@ -340,19 +463,21 @@ class InputRecorder:
 
     def _on_click(self, x: int, y: int, button: Any, pressed: bool) -> None:
         if self._running and pressed:
-            self._append(Step(type="click", x=int(x), y=int(y), button=self._button_name(button)))
+            metadata = get_uia_metadata_at_point(int(x), int(y))
+            window_title = get_active_window_title()
+            self._append(Step(type="click", x=int(x), y=int(y), button=self._button_name(button), window_title=window_title or None, **metadata))
 
     def _on_press(self, key: Any) -> None:
         if not self._running:
             return
         kind, value = self._key_payload(key)
-        self._append(Step(type="key", event="down", kind=kind, value=value))
+        self._append(Step(type="key", event="down", kind=kind, value=value, window_title=get_active_window_title() or None))
 
     def _on_release(self, key: Any) -> None:
         if not self._running:
             return
         kind, value = self._key_payload(key)
-        self._append(Step(type="key", event="up", kind=kind, value=value))
+        self._append(Step(type="key", event="up", kind=kind, value=value, window_title=get_active_window_title() or None))
 
 
 class WorkflowPlayer:
@@ -467,6 +592,64 @@ class WorkflowPlayer:
                 pass
         self._pressed_keys.clear()
 
+    @staticmethod
+    def _validate_window_context(step: Step) -> None:
+        expected = (step.window_title or "").strip()
+        if not expected:
+            return
+        current = get_active_window_title().strip()
+        if not current:
+            raise UserInterventionRequired("현재 활성 창을 확인할 수 없습니다. 대상 창을 확인한 뒤 다시 시도하세요.")
+        expected_folded, current_folded = expected.casefold(), current.casefold()
+        if expected_folded not in current_folded and current_folded not in expected_folded:
+            raise UserInterventionRequired(
+                f"활성 창이 기록 당시와 다릅니다. 기록: {expected[:160]} · 현재: {current[:160]}"
+            )
+
+    @staticmethod
+    def _uia_click_position(step: Step) -> tuple[int, int]:
+        if not any((step.uia_automation_id, step.uia_name, step.uia_control_type)):
+            if step.x is None or step.y is None:
+                raise RetryableAutomationError("클릭 단계에 좌표가 없습니다.")
+            return int(step.x), int(step.y)
+        try:
+            from pywinauto import Desktop
+            active = Desktop(backend="uia").get_active()
+            candidates = []
+            for control in active.descendants()[:300]:
+                try:
+                    info = control.element_info
+                    automation_id = str(getattr(info, "automation_id", "") or "")
+                    control_type = str(getattr(info, "control_type", "") or "")
+                    name = str(control.window_text() or "")
+                    if step.uia_automation_id and automation_id != step.uia_automation_id:
+                        continue
+                    if step.uia_control_type and control_type != step.uia_control_type:
+                        continue
+                    if step.uia_name and name != step.uia_name:
+                        continue
+                    if hasattr(control, "is_visible") and not control.is_visible():
+                        continue
+                    if hasattr(control, "is_enabled") and not control.is_enabled():
+                        continue
+                    rect = control.rectangle()
+                    if rect.right <= rect.left or rect.bottom <= rect.top:
+                        continue
+                    candidates.append((rect, control_type, name))
+                except Exception:
+                    continue
+            if len(candidates) == 1:
+                rect = candidates[0][0]
+                return int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2)
+            if len(candidates) > 1:
+                # Ambiguous matches are safer to reject than to guess.
+                raise RetryableAutomationError("UI Automation 요소가 여러 개라 대상을 특정할 수 없습니다.")
+        except RetryableAutomationError:
+            raise
+        except Exception as exc:
+            raise RetryableAutomationError(f"UI Automation 요소를 찾을 수 없습니다: {exc}") from exc
+        raise RetryableAutomationError("기록 당시 UI Automation 요소를 현재 화면에서 찾을 수 없습니다.")
+
     def play(self, workflow: Workflow) -> None:
         if pyautogui is None:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
@@ -482,13 +665,13 @@ class WorkflowPlayer:
                 self.current_step = step
                 if not self._sleep(step.delay) or self.stop_event.is_set():
                     break
+                self._validate_window_context(step)
                 if self.on_step:
                     self.on_step(index, step)
                 if step.type == "click":
-                    if step.x is None or step.y is None:
-                        continue
+                    x, y = self._uia_click_position(step)
                     button = step.button if step.button in self.BUTTONS else "left"
-                    pyautogui.click(step.x, step.y, button=button)
+                    pyautogui.click(x, y, button=button)
                 elif step.type == "key":
                     self._play_key(step)
                 elif step.type == "wait":
@@ -513,6 +696,7 @@ def ensure_app_dirs() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ERROR_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_screen_size() -> Optional[tuple[int, int]]:
@@ -590,10 +774,17 @@ def capture_observation() -> Dict[str, Any]:
     except Exception:
         ocr_text = "OCR을 사용할 수 없습니다. Windows에 Tesseract와 kor+eng 언어 데이터를 설치하면 화면 문자를 읽을 수 있습니다."
 
+    try:
+        from adapters import build_adapter_context
+    except ImportError:  # package import path for tests and embedded use
+        from app.adapters import build_adapter_context
+    application_context = build_adapter_context(active_window, ocr_text)
+
     return {
         "image_path": str(image_path),
         "screen_size": list(image.size),
         "active_window": active_window,
+        "application_context": application_context,
         "ocr_text": ocr_text[:12000],
         "ui_controls": ui_controls,
         "elements": element_records,
@@ -672,6 +863,7 @@ class LocalAIClient:
             "active_window": observation.get("active_window", ""),
             "screen_size": observation.get("screen_size", []),
             "ocr_text": observation.get("ocr_text", ""),
+            "application_context": observation.get("application_context", {}),
             "elements": observation.get("elements", [])[:120],
             "frame_hash": observation.get("frame_hash", ""),
         }

@@ -4,11 +4,14 @@ from pathlib import Path
 import pytest
 
 from app import engine
+from app.adapters import build_adapter_context, detect_application, normalize_excel_cell_reference, validate_pdf_page_number
 from app.engine import (
     LocalAIClient,
     Step,
     Workflow,
     WorkflowPlayer,
+    append_execution_history,
+    read_execution_history,
     load_workflow,
     save_workflow,
     validate_ai_steps,
@@ -47,11 +50,38 @@ def test_workflow_remove_step():
         workflow.remove_step(3)
 
 
+def test_workflow_edit_operations():
+    workflow = Workflow(steps=[Step(type="wait", value="1"), Step(type="wait", value="2")])
+    workflow.move_step(1, -1)
+    assert [step.value for step in workflow.steps] == ["2", "1"]
+    workflow.duplicate_step(0)
+    assert [step.value for step in workflow.steps] == ["2", "2", "1"]
+    workflow.update_step_delay(1, "1.23456")
+    assert workflow.steps[1].delay == 1.235
+    with pytest.raises(IndexError):
+        workflow.move_step(0, -1)
+    with pytest.raises(ValueError):
+        workflow.update_step_delay(0, 61)
+
+
 def test_workflow_rejects_invalid_screen_metadata():
     with pytest.raises(ValueError, match="화면 크기"):
         Workflow.from_dict({"version": 2, "recorded_screen_size": [0, 1080], "steps": []})
     with pytest.raises(ValueError, match="화면 크기"):
         Workflow.from_dict({"version": 2, "recorded_screen_size": [1920], "steps": []})
+
+
+def test_offline_application_adapters():
+    assert detect_application("Book1 - Excel") == "excel"
+    assert normalize_excel_cell_reference("$b$12") == "B12"
+    assert validate_pdf_page_number("3") == 3
+    context = build_adapter_context("report.pdf - Acrobat", "페이지 3")
+    assert context["application"] == "pdf"
+    assert context["page_numbers"] == [3]
+    with pytest.raises(ValueError):
+        normalize_excel_cell_reference("XFE1")
+    with pytest.raises(ValueError):
+        validate_pdf_page_number(0)
 
 
 def test_ai_plan_validation():
@@ -150,6 +180,19 @@ def test_ai_plan_rejects_zero_scroll_and_oversized_text():
     )
     assert valid is False
     assert "너무 깁니다" in message
+
+
+def test_execution_history_is_local_and_redacts_payload(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "TEMPLATE_DIR", tmp_path / "app" / "templates")
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "app" / "history.jsonl")
+    workflow = Workflow(name="이력 테스트", steps=[Step(type="wait", value="1")])
+    append_execution_history("completed", workflow, goal="비밀 목표", last_step=1)
+    records = read_execution_history()
+    assert records[0]["event"] == "completed"
+    assert records[0]["workflow"] == "이력 테스트"
+    assert records[0]["last_step"] == 1
+    assert records[0]["goal"] == "비밀 목표"
 
 
 def test_player_pause_and_resume_state():

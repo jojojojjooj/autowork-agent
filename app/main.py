@@ -7,14 +7,16 @@ import time
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, Optional
 
 from engine import (
     APP_DIR,
     CONFIG_PATH,
+    HISTORY_PATH,
     DEBUG_DIR,
     ERROR_DIR,
+    TEMPLATE_DIR,
     LOG_PATH,
     WORKFLOW_DIR,
     InputRecorder,
@@ -26,6 +28,8 @@ from engine import (
     get_screen_size,
     WorkflowPlayer,
     append_log,
+    append_execution_history,
+    read_execution_history,
     capture_observation,
     ensure_app_dirs,
     write_error_report,
@@ -132,6 +136,8 @@ class AutoWorkAgent(tk.Tk):
         self.pause_play_button = ttk.Button(top, text="재생 일시정지", command=self._toggle_pause_playback, state="disabled")
         self.pause_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="재생 중지", command=self._stop_playback).pack(side="left")
+        ttk.Button(top, text="템플릿 저장", command=self._save_template).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="템플릿 불러오기", command=self._load_template).pack(side="right")
         ttk.Button(top, text="선택 단계 삭제", command=self._delete_selected_step).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="저장", command=self._save_workflow).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="불러오기", command=self._load_workflow).pack(side="right")
@@ -145,6 +151,15 @@ class AutoWorkAgent(tk.Tk):
             wraplength=950,
             justify="left",
         ).pack(anchor="w")
+
+        edit_bar = ttk.Frame(self.record_tab)
+        edit_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(edit_bar, text="선택 단계 편집:").pack(side="left")
+        ttk.Button(edit_bar, text="위로", command=lambda: self._move_selected_step(-1)).pack(side="left", padx=(8, 3))
+        ttk.Button(edit_bar, text="아래로", command=lambda: self._move_selected_step(1)).pack(side="left", padx=3)
+        ttk.Button(edit_bar, text="복제", command=self._duplicate_selected_step).pack(side="left", padx=3)
+        ttk.Button(edit_bar, text="대기시간 수정", command=self._edit_selected_delay).pack(side="left", padx=3)
+        ttk.Label(edit_bar, text="단계를 선택하고 편집하세요. 실행 중에는 편집할 수 없습니다.", style="Sub.TLabel").pack(side="left", padx=(12, 0))
 
         name_row = ttk.Frame(self.record_tab)
         name_row.pack(fill="x", pady=(0, 8))
@@ -242,6 +257,7 @@ class AutoWorkAgent(tk.Tk):
         top = ttk.Frame(self.debug_tab)
         top.pack(fill="x", pady=(0, 10))
         ttk.Button(top, text="로그 새로고침", command=self._refresh_log_view).pack(side="left")
+        ttk.Button(top, text="실행 이력 새로고침", command=self._refresh_history_view).pack(side="left", padx=6)
         ttk.Button(top, text="로그 폴더 열기", command=self._open_log_folder).pack(side="left", padx=6)
         self.capture_on_error_enabled = bool(self._config_data.get("capture_on_error", True))
         self.capture_on_error_var = tk.BooleanVar(value=self.capture_on_error_enabled)
@@ -255,14 +271,24 @@ class AutoWorkAgent(tk.Tk):
         ).pack(anchor="w", pady=(0, 8))
         self.last_action_var = tk.StringVar(value="최근 상태: 대기 중")
         ttk.Label(self.debug_tab, textvariable=self.last_action_var, style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
-        log_frame = ttk.LabelFrame(self.debug_tab, text="최근 로그", style="Card.TLabelframe")
-        log_frame.pack(fill="both", expand=True)
+        body = ttk.Panedwindow(self.debug_tab, orient="vertical")
+        body.pack(fill="both", expand=True)
+        log_frame = ttk.LabelFrame(body, text="최근 로그", style="Card.TLabelframe")
+        body.add(log_frame, weight=3)
         self.log_text = tk.Text(log_frame, wrap="word", state="disabled", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side="right", fill="y")
+        history_frame = ttk.LabelFrame(body, text="실행 이력(입력 내용 제외)", style="Card.TLabelframe")
+        body.add(history_frame, weight=2)
+        self.history_text = tk.Text(history_frame, wrap="word", state="disabled", font=("Consolas", 9))
+        self.history_text.pack(side="left", fill="both", expand=True)
+        history_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=self.history_text.yview)
+        self.history_text.configure(yscrollcommand=history_scroll.set)
+        history_scroll.pack(side="right", fill="y")
         self._refresh_log_view()
+        self._refresh_history_view()
 
     def _refresh_log_view(self) -> None:
         if not hasattr(self, "log_text"):
@@ -276,6 +302,16 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             text = f"로그를 읽을 수 없습니다: {exc}"
         self._set_text(self.log_text, text)
+
+    def _refresh_history_view(self) -> None:
+        if not hasattr(self, "history_text"):
+            return
+        try:
+            records = read_execution_history(200)
+            text = "\n".join(json.dumps(record, ensure_ascii=False) for record in records) or "실행 이력이 아직 없습니다."
+        except Exception as exc:
+            text = f"실행 이력을 읽을 수 없습니다: {exc}"
+        self._set_text(self.history_text, text)
 
     def _open_log_folder(self) -> None:
         try:
@@ -394,23 +430,128 @@ class AutoWorkAgent(tk.Tk):
             detail = f"키 {step.event or ''}: {step.value or ''}"
         self.step_tree.insert("", "end", values=(index, step.type, f"{step.delay:.3f}", position, detail))
 
-    def _delete_selected_step(self) -> None:
-        if self.recording or self.player.running:
-            messagebox.showwarning("작업 실행 중", "기록 또는 재생 중에는 단계를 삭제할 수 없습니다.")
-            return
+    def _selected_step_index(self, show_message: bool = True) -> Optional[int]:
         selection = self.step_tree.selection()
         if not selection:
-            messagebox.showinfo("단계 선택 필요", "삭제할 단계를 먼저 선택하세요.")
-            return
-        item = selection[0]
+            if show_message:
+                messagebox.showinfo("단계 선택 필요", "편집할 단계를 먼저 선택하세요.")
+            return None
         try:
-            index = int(self.step_tree.item(item, "values")[0]) - 1
+            return int(self.step_tree.item(selection[0], "values")[0]) - 1
+        except (TypeError, ValueError, IndexError):
+            if show_message:
+                messagebox.showerror("단계 선택 오류", "선택한 단계 정보를 읽을 수 없습니다.")
+            return None
+
+    def _can_edit_steps(self) -> bool:
+        if self.recording or self.player.running:
+            messagebox.showwarning("작업 실행 중", "기록 또는 재생 중에는 단계를 편집할 수 없습니다.")
+            return False
+        return True
+
+    def _select_step(self, index: int) -> None:
+        items = self.step_tree.get_children()
+        if 0 <= index < len(items):
+            self.step_tree.selection_set(items[index])
+            self.step_tree.focus(items[index])
+
+    def _delete_selected_step(self) -> None:
+        if not self._can_edit_steps():
+            return
+        index = self._selected_step_index()
+        if index is None:
+            return
+        try:
             removed = self.workflow.remove_step(index)
-        except (IndexError, TypeError, ValueError) as exc:
+        except IndexError as exc:
             messagebox.showerror("단계 삭제 실패", str(exc))
             return
         self._refresh_steps()
         self._set_status(f"단계 삭제 완료 · {removed.type} · 남은 단계 {len(self.workflow.steps)}개")
+
+    def _move_selected_step(self, offset: int) -> None:
+        if not self._can_edit_steps():
+            return
+        index = self._selected_step_index()
+        if index is None:
+            return
+        try:
+            self.workflow.move_step(index, offset)
+        except IndexError as exc:
+            messagebox.showinfo("단계 이동", str(exc))
+            return
+        self._refresh_steps()
+        self._select_step(index + offset)
+        self._set_status("단계 순서 변경 완료")
+
+    def _duplicate_selected_step(self) -> None:
+        if not self._can_edit_steps():
+            return
+        index = self._selected_step_index()
+        if index is None:
+            return
+        try:
+            self.workflow.duplicate_step(index)
+        except IndexError as exc:
+            messagebox.showerror("단계 복제 실패", str(exc))
+            return
+        self._refresh_steps()
+        self._select_step(index + 1)
+        self._set_status("단계 복제 완료")
+
+    def _edit_selected_delay(self) -> None:
+        if not self._can_edit_steps():
+            return
+        index = self._selected_step_index()
+        if index is None:
+            return
+        current = self.workflow.steps[index].delay
+        value = simpledialog.askstring("대기시간 수정", "단계 시작 전 대기시간(초)을 입력하세요.\n허용 범위: 0~60", initialvalue=f"{current:.3f}", parent=self)
+        if value is None:
+            return
+        try:
+            self.workflow.update_step_delay(index, value)
+        except (IndexError, ValueError) as exc:
+            messagebox.showerror("대기시간 수정 실패", str(exc))
+            return
+        self._refresh_steps()
+        self._select_step(index)
+        self._set_status("대기시간 수정 완료")
+
+    def _save_template(self) -> None:
+        self.workflow.name = self.workflow_name_var.get().strip() or "새 템플릿"
+        path = filedialog.asksaveasfilename(
+            title="템플릿 저장",
+            initialdir=str(TEMPLATE_DIR),
+            initialfile=f"{self.workflow.name}.json",
+            defaultextension=".json",
+            filetypes=[("AutoWork 템플릿", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            save_workflow(self.workflow, Path(path))
+            self._set_status(f"템플릿 저장 완료 · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("템플릿 저장 실패", str(exc))
+
+    def _load_template(self) -> None:
+        if not self._can_edit_steps():
+            return
+        path = filedialog.askopenfilename(
+            title="템플릿 불러오기",
+            initialdir=str(TEMPLATE_DIR),
+            filetypes=[("AutoWork 템플릿", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.workflow = load_workflow(Path(path))
+            self.current_path = None
+            self._refresh_steps()
+            self._set_status(f"템플릿 불러오기 완료 · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("템플릿 불러오기 실패", str(exc))
 
     def _start_recording(self) -> None:
         if self.player.running:
@@ -489,10 +630,19 @@ class AutoWorkAgent(tk.Tk):
         threading.Thread(target=self._play_workflow_worker, daemon=True).start()
 
     def _play_workflow_worker(self) -> None:
+        recorded_size = self.workflow.recorded_screen_size
+        size_text = f"{recorded_size[0]}x{recorded_size[1]}" if recorded_size else ""
+        append_execution_history("playback_started", self.workflow, screen_size=size_text)
         try:
             self.player.play(self.workflow)
+            event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
+            append_execution_history(event, self.workflow, last_step=self.player.current_index)
+        except Exception as exc:
+            append_execution_history("playback_failed", self.workflow, last_step=self.player.current_index, error=type(exc).__name__)
+            raise
         finally:
             self.after(0, lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
+            self.after(0, self._refresh_history_view)
 
     def _save_workflow(self) -> None:
         self.workflow.name = self.workflow_name_var.get().strip() or "새 작업"
@@ -590,6 +740,7 @@ class AutoWorkAgent(tk.Tk):
         self.last_plan = plan
         obs_display = {
             "현재 창": observation.get("active_window", ""),
+            "애플리케이션 맥락": observation.get("application_context", {}),
             "화면 크기": observation.get("screen_size", []),
             "캡처 시각": observation.get("captured_at", ""),
             "OCR": observation.get("ocr_text", ""),
@@ -627,6 +778,13 @@ class AutoWorkAgent(tk.Tk):
         preview = "\n".join(f"{i}. {s.get('action')} · {s.get('reason', '')}" for i, s in enumerate(steps, 1))
         if not messagebox.askyesno("AI 계획 실행 최종 확인", f"요약: {summary}\n위험도: {risk}\n\n{preview}\n\n실행하시겠습니까?"):
             return
+        append_execution_history(
+            "ai_plan_approved",
+            self.workflow,
+            risk=str(risk),
+            plan_steps=len(steps),
+            dry_run=bool(self.dry_run_enabled),
+        )
         self.execute_plan_button.configure(state="disabled")
         self.stop_ai_button.configure(state="normal")
         self.ai_stop_event.clear()
@@ -711,6 +869,7 @@ class AutoWorkAgent(tk.Tk):
     def _run_ai_steps(self, steps: list[dict[str, Any]]) -> None:
         stopped = False
         failed_step: Dict[str, Any] = {}
+        outcome = "ai_plan_failed"
         try:
             if pyautogui is None:
                 raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
@@ -753,13 +912,16 @@ class AutoWorkAgent(tk.Tk):
                 if stopped:
                     break
                 self._set_status(f"AI 계획 실행 중: {index}/{len(steps)}")
+            outcome = "ai_plan_stopped" if stopped else ("ai_plan_dry_run_completed" if self.dry_run_enabled else "ai_plan_completed")
             self._set_status("AI 계획 사용자 중지" if stopped else ("AI 계획 검증 완료(dry-run)" if self.dry_run_enabled else "AI 계획 실행 완료"))
         except Exception as exc:
             report_path = self._handle_exception("AI 계획 실행", exc, {"failed_step": self.last_ai_index, "step": failed_step})
             self.after(0, lambda: self._show_exception_dialog("AI 계획 실행", exc, report_path))
         finally:
+            append_execution_history(outcome, self.workflow, last_step=self.last_ai_index, dry_run=bool(self.dry_run_enabled))
             self.ai_running = False
             self.after(0, lambda: self.execute_plan_button.configure(state="normal"))
+            self.after(0, self._refresh_history_view)
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
 
     def _load_config(self) -> None:

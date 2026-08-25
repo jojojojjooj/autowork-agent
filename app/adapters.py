@@ -1,0 +1,87 @@
+"""Best-effort, offline application context adapters.
+
+These adapters never open files or send data outside the local process. They only
+classify the active window title and extract conservative document hints from
+already-captured OCR text.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+EXCEL_CELL_RE = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})(?![A-Za-z0-9_])")
+EXCEL_RANGE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})\s*:\s*\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})(?![A-Za-z0-9_])",
+    re.I,
+)
+PAGE_RE = re.compile(r"(?:page|페이지|쪽)\s*[:#]?\s*([1-9][0-9]{0,5})", re.I)
+
+
+def detect_application(window_title: str) -> str:
+    """Classify a foreground window without inspecting its files."""
+    title = (window_title or "").casefold()
+    if any(token in title for token in ("excel", "엑셀", "microsoft 365")):
+        return "excel"
+    if any(token in title for token in ("acrobat", "pdf", "foxit", "알pdf")):
+        return "pdf"
+    if any(token in title for token in ("한글", "hwp", "한컴", "hanword")):
+        return "hwp"
+    if any(token in title for token in ("chrome", "edge", "firefox", "웨일", "whale", "browser")):
+        return "browser"
+    return "unknown"
+
+
+def normalize_excel_cell_reference(reference: str) -> str:
+    """Normalize and validate an A1-style Excel cell reference."""
+    candidate = (reference or "").strip().replace("$", "").upper()
+    match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,6})", candidate)
+    if not match:
+        raise ValueError("Excel 셀 주소는 A1 형식이어야 합니다.")
+    column, row = match.groups()
+    if len(column) == 3 and column > "XFD":
+        raise ValueError("Excel 열 범위(XFD)를 벗어난 셀 주소입니다.")
+    if int(row) > 1_048_576:
+        raise ValueError("Excel 행 범위(1,048,576)를 벗어난 셀 주소입니다.")
+    return f"{column}{int(row)}"
+
+
+def validate_pdf_page_number(page: Any) -> int:
+    """Validate a one-based PDF page number."""
+    try:
+        value = int(page)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("PDF 페이지는 정수여야 합니다.") from exc
+    if not 1 <= value <= 999_999:
+        raise ValueError("PDF 페이지는 1~999,999 범위여야 합니다.")
+    return value
+
+
+def build_adapter_context(window_title: str, ocr_text: str) -> dict[str, Any]:
+    """Return conservative context hints for the local AI prompt."""
+    application = detect_application(window_title)
+    text = (ocr_text or "")[:12_000]
+    context: dict[str, Any] = {"application": application, "hints": []}
+    if application == "excel":
+        ranges = [
+            f"{match.group(1).upper()}{int(match.group(2))}:{match.group(3).upper()}{int(match.group(4))}"
+            for match in EXCEL_RANGE_RE.finditer(text)
+        ]
+        cells = [
+            f"{match.group(1).upper()}{int(match.group(2))}"
+            for match in EXCEL_CELL_RE.finditer(text)
+        ]
+        context["cell_references"] = list(dict.fromkeys(cells))[:100]
+        context["ranges"] = list(dict.fromkeys(ranges))[:50]
+        context["hints"].append("Excel 셀 주소와 범위를 우선 확인하세요.")
+    elif application == "pdf":
+        pages = [int(match.group(1)) for match in PAGE_RE.finditer(text)]
+        context["page_numbers"] = list(dict.fromkeys(pages))[:50]
+        context["hints"].append("PDF 페이지 번호와 문서 상태를 확인하세요.")
+    elif application == "hwp":
+        context["hwp_document_detected"] = True
+        context["hints"].append("한글 문서의 현재 편집 상태와 저장 여부를 확인하세요.")
+    elif application == "browser":
+        context["hints"].append("브라우저의 현재 탭과 주소 표시줄 상태를 확인하세요.")
+    return context
