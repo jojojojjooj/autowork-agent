@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
 from urllib.parse import urlparse
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -40,6 +43,7 @@ ERROR_DIR = APP_DIR / "errors"
 DEBUG_DIR = APP_DIR / "debug_snapshots"
 TEMPLATE_DIR = APP_DIR / "templates"
 HISTORY_PATH = APP_DIR / "execution_history.jsonl"
+WORKFLOW_KEY_PATH = APP_DIR / "workflow.key"
 LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -52,7 +56,13 @@ MAX_HISTORY_RECORDS_ON_ROTATE = 1_000
 MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
+MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
 SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
+PII_PATTERNS = (
+    (re.compile(r"(?<!\d)\d{6}[- ]\d{7}(?!\d)"), "<주민번호 마스킹>"),
+    (re.compile(r"(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)"), "<전화번호 마스킹>"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<이메일 마스킹>"),
+)
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
 
@@ -71,10 +81,38 @@ def redact_sensitive(value: Any) -> Any:
     return value
 
 
+def mask_sensitive_text(text: str) -> str:
+    """Mask common personal identifiers before OCR text is persisted or sent to AI."""
+    masked = str(text or "")
+    for pattern, replacement in PII_PATTERNS:
+        masked = pattern.sub(replacement, masked)
+    return masked
+
+
+def mask_sensitive_image(image: Any) -> Any:
+    """Best-effort blackout of OCR tokens matching common personal identifiers."""
+    try:
+        import pytesseract
+        from PIL import ImageDraw
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, lang="kor+eng")
+        draw = ImageDraw.Draw(image)
+        for index, token in enumerate(data.get("text", [])):
+            if not token or token == mask_sensitive_text(token):
+                continue
+            left = int(data["left"][index])
+            top = int(data["top"][index])
+            width = int(data["width"][index])
+            height = int(data["height"][index])
+            draw.rectangle((left, top, left + width, top + height), fill="black")
+    except Exception:
+        pass
+    return image
+
+
 def append_log(message: str, level: str = "INFO") -> None:
     """Append a local diagnostic line without sending data anywhere."""
     ensure_app_dirs()
-    safe_message = str(redact_sensitive(message))
+    safe_message = mask_sensitive_text(str(redact_sensitive(message)))
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {safe_message}\n"
     with _LOG_LOCK:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
@@ -107,6 +145,61 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
     except OSError as exc:
         # Audit history is useful but must never block the requested automation.
         append_log(f"실행 이력 저장 실패: {exc}", "WARNING")
+
+
+def validate_schedule_interval(value: Any) -> int:
+    """Validate a low-frequency local schedule interval in seconds."""
+    try:
+        interval = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("예약 간격은 정수 초 단위여야 합니다.") from exc
+    if not 60 <= interval <= MAX_SCHEDULE_INTERVAL_SECONDS:
+        raise ValueError("예약 간격은 60초~24시간 범위여야 합니다.")
+    return interval
+
+
+class LocalScheduler:
+    """Run a callback at a low frequency while the desktop app remains open."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self.callback = callback
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self.interval_seconds = 0
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self, interval_seconds: int, run_immediately: bool = False) -> None:
+        interval = validate_schedule_interval(interval_seconds)
+        with self._lock:
+            if self.running:
+                raise RuntimeError("예약 실행이 이미 동작 중입니다.")
+            self.interval_seconds = interval
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, args=(interval, run_immediately), daemon=True, name="autowork-scheduler")
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thread = None
+
+    def _run(self, interval: int, run_immediately: bool) -> None:
+        if run_immediately:
+            try:
+                self.callback()
+            except Exception as exc:
+                append_log(f"예약 실행 콜백 실패: {exc}", "ERROR")
+        while not self._stop_event.wait(interval):
+            try:
+                self.callback()
+            except Exception as exc:
+                append_log(f"예약 실행 콜백 실패: {exc}", "ERROR")
 
 
 def trim_execution_history(max_bytes: int = MAX_HISTORY_FILE_BYTES) -> None:
@@ -159,7 +252,24 @@ def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
     return records
 
 
-def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None) -> Path:
+def summarize_execution_history(records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Summarize bounded audit records without exposing input contents."""
+    items = records if records is not None else read_execution_history(2_000)
+    events = Counter(str(item.get("event", "unknown")) for item in items)
+    completed = sum(events[event] for event in ("playback_completed", "ai_plan_completed"))
+    failed = sum(count for event, count in events.items() if event.endswith("_failed"))
+    runs = completed + failed
+    return {
+        "total_events": len(items),
+        "completed_runs": completed,
+        "failed_runs": failed,
+        "success_rate": round((completed / runs) * 100, 1) if runs else None,
+        "events": dict(events),
+        "last_event": items[-1].get("event") if items else None,
+    }
+
+
+def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None, mask_sensitive: bool = True) -> Path:
     """Write a local JSON error report and optionally a screen snapshot."""
     ensure_app_dirs()
     stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
@@ -168,16 +278,19 @@ def write_error_report(context: Dict[str, Any], exc: BaseException, capture_scre
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "context": redact_sensitive(context),
         "error_type": type(exc).__name__,
-        "error": str(exc)[:4000],
-        "traceback": (traceback_text or traceback.format_exc())[-16000:],
+        "error": mask_sensitive_text(str(exc)[:4000]),
+        "traceback": mask_sensitive_text((traceback_text or traceback.format_exc())[-16000:]),
     }
     if capture_screen and pyautogui is not None:
         try:
             image_path = DEBUG_DIR / f"error_{stamp}.png"
-            pyautogui.screenshot().save(image_path)
+            image = pyautogui.screenshot()
+            if mask_sensitive:
+                image = mask_sensitive_image(image)
+            image.save(image_path)
             report["screen_snapshot"] = str(image_path)
         except Exception as snapshot_exc:
-            report["screen_snapshot_error"] = str(snapshot_exc)[:1000]
+            report["screen_snapshot_error"] = mask_sensitive_text(str(snapshot_exc)[:1000])
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     append_log(f"오류 보고서 생성: {report_path} · {type(exc).__name__}: {str(exc)[:500]}", "ERROR")
     return report_path
@@ -298,15 +411,19 @@ class Workflow:
     description: str = ""
     steps: List[Step] = field(default_factory=list)
     recorded_screen_size: Optional[List[int]] = None
+    signature: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_signature: bool = True) -> Dict[str, Any]:
+        payload = {
             "version": WORKFLOW_VERSION,
             "name": self.name[:200],
             "description": self.description[:2000],
             "recorded_screen_size": self.recorded_screen_size,
             "steps": [asdict(step) for step in self.steps],
         }
+        if include_signature and self.signature:
+            payload["signature"] = self.signature
+        return payload
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Workflow":
@@ -366,6 +483,9 @@ class Workflow:
         name = data.get("name", "불러온 작업")
         description = data.get("description", "")
         recorded_screen_size = data.get("recorded_screen_size")
+        signature = data.get("signature")
+        if signature is not None and (not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature)):
+            raise ValueError("작업 파일 서명이 올바르지 않습니다.")
         if not isinstance(name, str) or not isinstance(description, str):
             raise ValueError("작업 이름과 설명은 문자열이어야 합니다.")
         if recorded_screen_size is not None:
@@ -382,12 +502,14 @@ class Workflow:
             description=description[:2000],
             steps=steps,
             recorded_screen_size=recorded_screen_size,
+            signature=signature,
         )
 
     def remove_step(self, index: int) -> Step:
         """Remove and return one step using a zero-based index."""
         if not 0 <= index < len(self.steps):
             raise IndexError("삭제할 작업 단계가 없습니다.")
+        self.signature = None
         return self.steps.pop(index)
 
     def move_step(self, index: int, offset: int) -> None:
@@ -398,6 +520,7 @@ class Workflow:
         if not 0 <= target < len(self.steps):
             raise IndexError("작업 단계를 더 이동할 수 없습니다.")
         self.steps[index], self.steps[target] = self.steps[target], self.steps[index]
+        self.signature = None
 
     def duplicate_step(self, index: int) -> Step:
         """Insert a copy immediately after one step and return the copy."""
@@ -405,6 +528,7 @@ class Workflow:
             raise IndexError("복제할 작업 단계가 없습니다.")
         copied = replace(self.steps[index])
         self.steps.insert(index + 1, copied)
+        self.signature = None
         return copied
 
     def update_step_delay(self, index: int, delay: float) -> None:
@@ -418,6 +542,7 @@ class Workflow:
         if not 0 <= value <= 60:
             raise ValueError("대기 시간은 0~60초 범위여야 합니다.")
         self.steps[index].delay = round(value, 3)
+        self.signature = None
 
 
 def get_active_window_title() -> str:
@@ -459,6 +584,50 @@ def get_uia_metadata_at_point(x: int, y: int) -> Dict[str, str]:
     except Exception:
         pass
     return {}
+
+
+def _workflow_canonical_bytes(workflow: Workflow) -> bytes:
+    return json.dumps(workflow.to_dict(include_signature=False), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _get_workflow_signing_key() -> bytes:
+    ensure_app_dirs()
+    try:
+        if WORKFLOW_KEY_PATH.exists():
+            key = WORKFLOW_KEY_PATH.read_bytes()
+            if len(key) >= 32:
+                return key
+        key = secrets.token_bytes(32)
+        temporary = WORKFLOW_KEY_PATH.with_suffix(".tmp")
+        temporary.write_bytes(key)
+        os.replace(temporary, WORKFLOW_KEY_PATH)
+        try:
+            os.chmod(WORKFLOW_KEY_PATH, 0o600)
+        except OSError:
+            pass
+        return key
+    except OSError as exc:
+        raise RuntimeError(f"작업 서명 키를 준비할 수 없습니다: {exc}") from exc
+
+
+def sign_workflow(workflow: Workflow) -> str:
+    """Sign a workflow using a local key; the key never leaves this machine."""
+    if not isinstance(workflow, Workflow):
+        raise TypeError("Workflow 객체만 서명할 수 있습니다.")
+    signature = hmac.new(_get_workflow_signing_key(), _workflow_canonical_bytes(workflow), hashlib.sha256).hexdigest()
+    workflow.signature = signature
+    return signature
+
+
+def verify_workflow_signature(workflow: Workflow) -> bool:
+    """Return whether a workflow has a valid local signature."""
+    if not isinstance(workflow, Workflow) or not workflow.signature:
+        return False
+    try:
+        expected = hmac.new(_get_workflow_signing_key(), _workflow_canonical_bytes(workflow), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(workflow.signature, expected)
+    except (OSError, RuntimeError, TypeError):
+        return False
 
 
 class InputRecorder:
@@ -575,6 +744,7 @@ class WorkflowPlayer:
         self.running = False
         self.current_index = 0
         self.current_step: Optional[Step] = None
+        self.last_error: Optional[BaseException] = None
         self._pressed_keys: set[str] = set()
         self.failed: Optional[BaseException] = None
         self.failure_index = 0
@@ -726,9 +896,11 @@ class WorkflowPlayer:
             raise RetryableAutomationError(f"UI Automation 요소를 찾을 수 없습니다: {exc}") from exc
         raise RetryableAutomationError("기록 당시 UI Automation 요소를 현재 화면에서 찾을 수 없습니다.")
 
-    def play(self, workflow: Workflow) -> None:
+    def play(self, workflow: Workflow, start_index: int = 0) -> None:
         if pyautogui is None:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
+        if not isinstance(start_index, int) or start_index < 0 or start_index > len(workflow.steps):
+            raise ValueError("재생 시작 단계가 올바르지 않습니다.")
         current_screen = get_screen_size()
         valid, reason = validate_workflow(workflow, current_screen)
         if not valid:
@@ -739,12 +911,13 @@ class WorkflowPlayer:
         self.pause_event.clear()
         self.failed = None
         self.failure_index = 0
+        self.last_error = None
         self.running = True
         try:
             pyautogui.PAUSE = 0.03
             pyautogui.FAILSAFE = True
             total = len(workflow.steps)
-            for index, step in enumerate(workflow.steps, start=1):
+            for index, step in enumerate(workflow.steps[start_index:], start=start_index + 1):
                 self.current_index = index
                 self.current_step = step
                 if not self._sleep(step.delay) or self.stop_event.is_set():
@@ -765,6 +938,7 @@ class WorkflowPlayer:
         except Exception as exc:
             self.failed = exc
             self.failure_index = self.current_index
+            self.last_error = exc
             if self.on_error and self.current_step is not None:
                 self.on_error(exc, self.current_index, self.current_step)
             else:
@@ -967,7 +1141,7 @@ def capture_observation() -> Dict[str, Any]:
     ocr_text = ""
     try:
         import pytesseract
-        ocr_text = pytesseract.image_to_string(image, lang="kor+eng")
+        ocr_text = mask_sensitive_text(pytesseract.image_to_string(image, lang="kor+eng"))
     except Exception:
         ocr_text = "OCR을 사용할 수 없습니다. Windows에 Tesseract와 kor+eng 언어 데이터를 설치하면 화면 문자를 읽을 수 있습니다."
 
@@ -1107,6 +1281,7 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
     valid, reason = validate_workflow(workflow)
     if not valid:
         raise ValueError(reason)
+    sign_workflow(workflow)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2)
@@ -1121,7 +1296,7 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
             temporary.unlink()
 
 
-def load_workflow(path: Path) -> Workflow:
+def load_workflow(path: Path, require_signature: bool = False) -> Workflow:
     path = Path(path)
     if path.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
         raise ValueError("작업 파일이 너무 큽니다.")
@@ -1129,7 +1304,13 @@ def load_workflow(path: Path) -> Workflow:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"작업 파일을 읽을 수 없습니다: {exc}") from exc
-    return Workflow.from_dict(data)
+    workflow = Workflow.from_dict(data)
+    if workflow.signature:
+        if not verify_workflow_signature(workflow):
+            raise ValueError("작업 파일 서명이 일치하지 않습니다. 파일이 변조되었을 수 있습니다.")
+    elif require_signature:
+        raise ValueError("서명되지 않은 작업 파일은 현재 보안 설정에서 허용되지 않습니다.")
+    return workflow
 
 
 def validate_ai_steps(

@@ -21,6 +21,7 @@ from engine import (
     WORKFLOW_DIR,
     InputRecorder,
     LocalAIClient,
+    LocalScheduler,
     RetryableAutomationError,
     UserInterventionRequired,
     Step,
@@ -30,18 +31,21 @@ from engine import (
     append_log,
     append_execution_history,
     read_execution_history,
+    summarize_execution_history,
     capture_observation,
     cleanup_expired_artifacts,
     ensure_app_dirs,
     redact_sensitive,
     inspect_workflow,
     validate_workflow,
+    verify_workflow_signature,
     write_error_report,
     load_workflow,
     save_workflow,
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
+    validate_schedule_interval,
 )
 
 try:
@@ -80,12 +84,16 @@ class AutoWorkAgent(tk.Tk):
         self.ai_running = False
         self._ai_job_lock = threading.Lock()
         self._playback_launch_lock = threading.Lock()
+        self._step_gate = threading.Event()
+        self.step_mode_enabled = False
+        self.last_failed_step_index: Optional[int] = None
         self.last_ai_index = 0
         self.dry_run_enabled = True
         self.capture_on_error_enabled = True
 
         self.recorder = InputRecorder(on_step=self._on_recorded_step, on_error=self._on_recorder_error)
         self.player = WorkflowPlayer(on_step=self._on_play_step, on_status=self._set_status, on_error=self._on_player_error)
+        self.scheduler = LocalScheduler(self._scheduled_run)
 
         self._load_config()
         self._build_style()
@@ -144,6 +152,8 @@ class AutoWorkAgent(tk.Tk):
         self.pause_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="재생 중지", command=self._stop_playback).pack(side="left")
         ttk.Button(top, text="안전 점검", command=self._inspect_current_workflow).pack(side="left", padx=(12, 0))
+        self.resume_play_button = ttk.Button(top, text="실패 단계부터 재개", command=self._resume_failed_workflow, state="disabled")
+        self.resume_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="템플릿 저장", command=self._save_template).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="템플릿 불러오기", command=self._load_template).pack(side="right")
         ttk.Button(top, text="선택 단계 삭제", command=self._delete_selected_step).pack(side="right", padx=(6, 0))
@@ -167,6 +177,8 @@ class AutoWorkAgent(tk.Tk):
         ttk.Button(edit_bar, text="아래로", command=lambda: self._move_selected_step(1)).pack(side="left", padx=3)
         ttk.Button(edit_bar, text="복제", command=self._duplicate_selected_step).pack(side="left", padx=3)
         ttk.Button(edit_bar, text="대기시간 수정", command=self._edit_selected_delay).pack(side="left", padx=3)
+        self.step_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(edit_bar, text="단계별 승인", variable=self.step_mode_var).pack(side="left", padx=(12, 0))
         ttk.Label(edit_bar, text="단계를 선택하고 편집하세요. 실행 중에는 편집할 수 없습니다.", style="Sub.TLabel").pack(side="left", padx=(12, 0))
 
         name_row = ttk.Frame(self.record_tab)
@@ -252,6 +264,15 @@ class AutoWorkAgent(tk.Tk):
         self.dry_run_var = tk.BooleanVar(value=self.dry_run_enabled)
         ttk.Checkbutton(card, text="AI 계획은 실제 입력 없이 검증만 수행(dry-run)", variable=self.dry_run_var, command=self._sync_safety_settings).grid(row=4, column=1, sticky="w", pady=6)
         ttk.Button(card, text="설정 저장", command=self._save_config).grid(row=5, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(card, text="예약 실행 간격(초)", width=22).grid(row=6, column=0, sticky="w", pady=(18, 6))
+        self.schedule_interval_var = tk.StringVar(value=str(self._config_data.get("schedule_interval", 3600)))
+        ttk.Entry(card, textvariable=self.schedule_interval_var, width=18).grid(row=6, column=1, sticky="w", pady=(18, 6))
+        self.schedule_status_var = tk.StringVar(value="예약 실행 중지")
+        ttk.Label(card, textvariable=self.schedule_status_var, style="Sub.TLabel").grid(row=7, column=1, sticky="w")
+        schedule_buttons = ttk.Frame(card)
+        schedule_buttons.grid(row=8, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(schedule_buttons, text="예약 시작", command=self._start_scheduler).pack(side="left")
+        ttk.Button(schedule_buttons, text="예약 중지", command=self._stop_scheduler).pack(side="left", padx=6)
         ttk.Label(
             self.settings_tab,
             text="기본값은 Ollama의 OpenAI 호환 주소입니다. LM Studio 등 다른 로컬 서버를 쓰면 주소와 모델 이름만 바꾸면 됩니다. "
@@ -316,7 +337,10 @@ class AutoWorkAgent(tk.Tk):
             return
         try:
             records = read_execution_history(200)
-            text = "\n".join(json.dumps(record, ensure_ascii=False) for record in records) or "실행 이력이 아직 없습니다."
+            summary = summarize_execution_history(records)
+            success_rate = "-" if summary["success_rate"] is None else f"{summary['success_rate']:.1f}%"
+            header = f"통계 · 이벤트 {summary['total_events']} · 완료 {summary['completed_runs']} · 실패 {summary['failed_runs']} · 성공률 {success_rate} · 마지막 이벤트 {summary['last_event'] or '-'}"
+            text = header + "\n\n" + ("\n".join(json.dumps(record, ensure_ascii=False) for record in records) or "실행 이력이 아직 없습니다.")
         except Exception as exc:
             text = f"실행 이력을 읽을 수 없습니다: {exc}"
         self._set_text(self.history_text, text)
@@ -365,7 +389,10 @@ class AutoWorkAgent(tk.Tk):
         self.after(0, self._stop_recording)
 
     def _on_player_error(self, exc: BaseException, index: int, step: Step) -> None:
-        report_path = self._handle_exception("작업 재생", exc, {"failed_step": index, "step": step.__dict__})
+        self.last_failed_step_index = max(0, index - 1)
+        if hasattr(self, "resume_play_button"):
+            self.after(0, lambda: self.resume_play_button.configure(state="normal"))
+        report_path = self._handle_exception("작업 재생", exc, {"failed_step": index, "step": redact_sensitive(step.__dict__)})
         self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
 
     def report_callback_exception(self, exc: type[BaseException], value: BaseException, tb: Any) -> None:
@@ -606,6 +633,22 @@ class AutoWorkAgent(tk.Tk):
         self.stop_record_button.configure(state="disabled")
         self._set_status(f"기록 중지 · {len(self.workflow.steps)}개 단계")
 
+    def _show_step_confirmation(self, index: int, step: Step) -> None:
+        if not self.step_mode_enabled or not self.player.running:
+            self._step_gate.set()
+            return
+        detail = f"{index}. {step.type}"
+        if step.type == "click":
+            detail += f" · ({step.x}, {step.y}) · {step.button or 'left'}"
+        elif step.type == "key":
+            detail += f" · {step.event or ''} {step.value or ''}"
+        elif step.type == "wait":
+            detail += f" · {step.value or 0.5}초"
+        approved = messagebox.askyesno("단계별 승인", f"다음 동작을 실행할까요?\n\n{detail}")
+        if not approved:
+            self.player.stop()
+        self._step_gate.set()
+
     def _toggle_pause_playback(self) -> None:
         if not self.player.running:
             return
@@ -618,6 +661,7 @@ class AutoWorkAgent(tk.Tk):
 
     def _stop_playback(self) -> None:
         self.player.stop()
+        self._step_gate.set()
         if hasattr(self, "pause_play_button"):
             self.pause_play_button.configure(state="disabled", text="재생 일시정지")
         self._set_status("재생 중지 요청")
@@ -628,6 +672,38 @@ class AutoWorkAgent(tk.Tk):
 
     def _on_play_step(self, index: int, step: Step) -> None:
         self.after(0, lambda: self.step_tree.selection_set(self.step_tree.get_children()[index - 1]))
+        if self.step_mode_enabled:
+            self._step_gate.clear()
+            self.after(0, lambda: self._show_step_confirmation(index, step))
+            if not self._step_gate.wait(timeout=300):
+                self.player.stop()
+
+    def _resume_failed_workflow(self) -> None:
+        start_index = self.last_failed_step_index
+        if start_index is None:
+            messagebox.showinfo("재개할 작업 없음", "최근 실패한 작업이 없습니다.")
+            return
+        if self.recording or self.player.running:
+            messagebox.showwarning("작업 실행 중", "기록 또는 재생 중에는 재개할 수 없습니다.")
+            return
+        report = inspect_workflow(self.workflow, get_screen_size())
+        if not report["valid"]:
+            messagebox.showerror("재개할 수 없는 작업", report["reason"])
+            return
+        step_number = start_index + 1
+        warning = "\n".join(report["warnings"])
+        prompt = f"{step_number}번째 실패 단계부터 다시 실행합니다.\n\n재개 시 실패한 입력 동작이 다시 실행될 수 있습니다."
+        if warning:
+            prompt += f"\n\n경고: {warning}"
+        if not messagebox.askyesno("실패 단계부터 재개", prompt):
+            return
+        if not self._playback_launch_lock.acquire(blocking=False):
+            messagebox.showwarning("재생 중", "이미 다른 작업을 재생 중입니다.")
+            return
+        self.step_mode_enabled = bool(self.step_mode_var.get())
+        self._step_gate.clear()
+        self.pause_play_button.configure(state="normal", text="재생 일시정지")
+        threading.Thread(target=self._play_workflow_worker, args=(self.workflow, start_index), daemon=True).start()
 
     def _play_workflow(self) -> None:
         if self.recording:
@@ -663,30 +739,39 @@ class AutoWorkAgent(tk.Tk):
         if not ok:
             self._playback_launch_lock.release()
             return
+        self.last_failed_step_index = None
+        self.resume_play_button.configure(state="disabled")
+        self.step_mode_enabled = bool(self.step_mode_var.get())
+        self._step_gate.clear()
         self.pause_play_button.configure(state="normal", text="재생 일시정지")
         threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True).start()
 
-    def _play_workflow_worker(self, workflow: Workflow) -> None:
+    def _play_workflow_worker(self, workflow: Workflow, start_index: int = 0) -> None:
         recorded_size = workflow.recorded_screen_size
         size_text = f"{recorded_size[0]}x{recorded_size[1]}" if recorded_size else ""
-        append_execution_history("playback_started", workflow, screen_size=size_text)
+        append_execution_history("playback_started", workflow, screen_size=size_text, start_step=start_index + 1)
         try:
-            self.player.play(workflow)
-            if self.player.failed is not None:
+            self.player.play(workflow, start_index=start_index)
+            failure = self.player.failed or self.player.last_error
+            if failure is not None:
                 append_execution_history(
                     "playback_failed",
                     workflow,
-                    last_step=self.player.failure_index,
-                    error=type(self.player.failed).__name__,
+                    last_step=self.player.failure_index or self.player.current_index,
+                    error=type(failure).__name__,
                 )
             else:
                 event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
                 append_execution_history(event, workflow, last_step=self.player.current_index)
+                self.last_failed_step_index = None
+                self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
         except Exception as exc:
             append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__)
             report_path = self._handle_exception("작업 재생", exc)
             self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
         finally:
+            self._step_gate.set()
+            self.step_mode_enabled = False
             self._playback_launch_lock.release()
             self.after(0, lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
             self.after(0, self._refresh_history_view)
@@ -721,7 +806,8 @@ class AutoWorkAgent(tk.Tk):
             self.workflow = load_workflow(Path(path))
             self.current_path = Path(path)
             self._refresh_steps()
-            self._set_status(f"불러오기 완료 · {self.current_path.name}")
+            signature_status = "서명 확인" if verify_workflow_signature(self.workflow) else "레거시 작업(서명 없음)"
+            self._set_status(f"불러오기 완료 · {self.current_path.name} · {signature_status}")
         except Exception as exc:
             messagebox.showerror("불러오기 실패", str(exc))
 
@@ -987,7 +1073,7 @@ class AutoWorkAgent(tk.Tk):
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
 
     def _load_config(self) -> None:
-        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": "120", "vision": False, "capture_on_error": True}
+        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": "120", "vision": False, "capture_on_error": True, "schedule_interval": 3600}
         data: Dict[str, Any] = {}
         try:
             if CONFIG_PATH.exists():
@@ -1012,6 +1098,7 @@ class AutoWorkAgent(tk.Tk):
                 "vision": bool(self.vision_var.get()),
                 "capture_on_error": bool(self.capture_on_error_var.get()),
                 "dry_run": bool(self.dry_run_var.get()),
+                "schedule_interval": validate_schedule_interval(self.schedule_interval_var.get().strip()),
             }
             temp_path = CONFIG_PATH.with_suffix(".tmp")
             temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1020,7 +1107,50 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             messagebox.showerror("설정 저장 실패", str(exc))
 
+    def _start_scheduler(self) -> None:
+        try:
+            interval = validate_schedule_interval(self.schedule_interval_var.get().strip())
+            self.scheduler.start(interval)
+            self.schedule_status_var.set(f"예약 실행 중 · {interval}초 간격")
+            append_execution_history("scheduler_started", self.workflow, interval_seconds=interval)
+            self._set_status(f"예약 실행 시작 · {interval}초 간격")
+        except Exception as exc:
+            messagebox.showerror("예약 실행 시작 실패", str(exc))
+
+    def _stop_scheduler(self) -> None:
+        self.scheduler.stop()
+        if hasattr(self, "schedule_status_var"):
+            self.schedule_status_var.set("예약 실행 중지")
+        append_execution_history("scheduler_stopped", self.workflow)
+        self._set_status("예약 실행 중지")
+
+    def _scheduled_run(self) -> None:
+        """Queue a scheduled playback check on Tk's main thread."""
+        try:
+            self.after(0, self._launch_scheduled_playback)
+        except tk.TclError:
+            return
+
+    def _launch_scheduled_playback(self) -> None:
+        if self.recording or self.player.running or not self.workflow.steps:
+            append_execution_history("scheduled_run_skipped", self.workflow, reason="busy_or_empty")
+            return
+        valid, reason = validate_workflow(self.workflow, get_screen_size())
+        if not valid:
+            append_execution_history("scheduled_run_skipped", self.workflow, reason="invalid_workflow")
+            self._set_status(f"예약 실행 건너뜀 · {reason}")
+            return
+        if not self._playback_launch_lock.acquire(blocking=False):
+            append_execution_history("scheduled_run_skipped", self.workflow, reason="playback_locked")
+            return
+        self.step_mode_enabled = False
+        self._step_gate.clear()
+        self.pause_play_button.configure(state="normal", text="재생 일시정지")
+        append_execution_history("scheduled_run_approved", self.workflow)
+        threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True, name="scheduled-playback").start()
+
     def _on_close(self) -> None:
+        self.scheduler.stop()
         self.recorder.stop()
         self.player.stop()
         self.ai_stop_event.set()

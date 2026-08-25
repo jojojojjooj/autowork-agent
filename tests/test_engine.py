@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -7,11 +8,15 @@ from app import engine
 from app.adapters import build_adapter_context, detect_application, normalize_excel_cell_reference, validate_pdf_page_number
 from app.engine import (
     LocalAIClient,
+    LocalScheduler,
     Step,
     Workflow,
     WorkflowPlayer,
     append_execution_history,
+    mask_sensitive_text,
     read_execution_history,
+    sign_workflow,
+    summarize_execution_history,
     trim_execution_history,
     inspect_workflow,
     load_workflow,
@@ -19,8 +24,10 @@ from app.engine import (
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
+    validate_schedule_interval,
     validate_workflow,
     resolve_observed_element,
+    verify_workflow_signature,
     write_error_report,
 )
 
@@ -43,6 +50,17 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
     assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_workflow_signature_detects_tampering(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "WORKFLOW_KEY_PATH", tmp_path / "app" / "workflow.key")
+    workflow = Workflow(steps=[Step(type="wait", value="1")])
+    signature = sign_workflow(workflow)
+    assert len(signature) == 64
+    assert verify_workflow_signature(workflow) is True
+    workflow.steps[0].value = "2"
+    assert verify_workflow_signature(workflow) is False
 
 
 def test_workflow_remove_step():
@@ -261,6 +279,33 @@ def test_workflow_is_saved_as_version_2_and_rejects_unsafe_steps(tmp_path: Path)
 
     with pytest.raises(ValueError, match="동작 유형"):
         Workflow.from_dict({"version": 2, "steps": [{"type": "shell"}]})
+
+
+def test_scheduler_and_schedule_interval():
+    triggered = threading.Event()
+    scheduler = LocalScheduler(triggered.set)
+    assert validate_schedule_interval(60) == 60
+    with pytest.raises(ValueError):
+        validate_schedule_interval(59)
+    scheduler.start(60, run_immediately=True)
+    assert triggered.wait(1.0)
+    scheduler.stop()
+    assert scheduler.running is False
+
+
+def test_sensitive_text_masking_and_history_summary():
+    masked = mask_sensitive_text("연락처 010-1234-5678, 이메일 test@example.com, 주민번호 900101-1234567")
+    assert "010-1234-5678" not in masked
+    assert "test@example.com" not in masked
+    assert "900101-1234567" not in masked
+    summary = summarize_execution_history([
+        {"event": "playback_completed"},
+        {"event": "playback_failed"},
+        {"event": "scheduler_started"},
+    ])
+    assert summary["completed_runs"] == 1
+    assert summary["failed_runs"] == 1
+    assert summary["success_rate"] == 50.0
 
 
 def test_local_endpoint_and_timeout_are_strictly_bounded():
