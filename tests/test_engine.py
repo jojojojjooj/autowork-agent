@@ -20,6 +20,7 @@ from app.engine import (
     validate_local_endpoint,
     validate_timeout,
     validate_workflow,
+    resolve_observed_element,
     write_error_report,
 )
 
@@ -115,6 +116,57 @@ def test_ai_plan_rejects_direct_coordinates():
     valid, message = validate_ai_steps({"steps": [{"action": "click", "x": 10, "y": 20}]}, (1920, 1080), {"elements": []})
     assert valid is False
     assert "구조화 계획 형식 오류" in message or "element_id" in message
+
+
+def test_ai_plan_semantic_rebinding_after_element_id_change():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [{
+            "id": "uia_new_search",
+            "role": "button",
+            "name": "검색",
+            "control_type": "Button",
+            "bbox": [10, 20, 110, 60],
+            "source": "uia",
+            "enabled": True,
+            "visible": True,
+        }],
+    }
+    action = engine.UIAction(
+        action="click",
+        element_id="uia_old_search",
+        element_role="button",
+        element_name="검색",
+        element_control_type="Button",
+        confidence=0.95,
+        risk="read",
+    )
+    resolved = resolve_observed_element(action, observation)
+    assert resolved is not None
+    assert resolved.id == "uia_new_search"
+    valid, message = validate_ai_steps(
+        {"steps": [action.model_dump()]},
+        (1920, 1080),
+        observation,
+    )
+    assert valid is True
+    assert message == "검증 완료"
+
+
+def test_ai_plan_semantic_rebinding_rejects_ambiguous_elements():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [
+            {"id": "uia_a", "role": "button", "name": "확인", "control_type": "Button", "bbox": [0, 0, 50, 30], "source": "uia"},
+            {"id": "uia_b", "role": "button", "name": "확인", "control_type": "Button", "bbox": [60, 0, 110, 30], "source": "uia"},
+        ],
+    }
+    action = engine.UIAction(action="click", element_id="uia_missing", element_role="button", element_name="확인", element_control_type="Button", confidence=0.95, risk="read")
+    resolved = resolve_observed_element(action, observation)
+    assert resolved is None
+    valid, message = validate_ai_steps({"steps": [action.model_dump()]}, (1920, 1080), observation)
+    assert valid is False
+    assert "하나로 특정" in message
 
 
 def test_workflow_inspection_reports_counts_and_screen_warning():

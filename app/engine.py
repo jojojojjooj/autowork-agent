@@ -253,6 +253,9 @@ class UIAction(BaseModel):
     requires_confirmation: bool = True
     reason: str = ""
     expected_texts: list[str] = Field(default_factory=list)
+    element_role: Optional[str] = None
+    element_name: Optional[str] = None
+    element_control_type: Optional[str] = None
 
 
 class AutomationPlan(BaseModel):
@@ -828,6 +831,27 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
     return True, "검증 완료"
 
 
+def resolve_observed_element(action: UIAction, observation: Dict[str, Any]) -> Optional[ObservedElement]:
+    """Resolve an AI action to one current element, allowing safe semantic re-binding."""
+    try:
+        elements = [ObservedElement.model_validate(item) for item in observation.get("elements", [])]
+    except ValidationError:
+        return None
+    exact = [element for element in elements if element.id == action.element_id]
+    if len(exact) == 1:
+        return exact[0]
+    candidates = elements
+    if action.element_role:
+        candidates = [element for element in candidates if element.role.casefold() == action.element_role.strip().casefold()]
+    if action.element_control_type:
+        candidates = [element for element in candidates if (element.control_type or "").casefold() == action.element_control_type.strip().casefold()]
+    if action.element_name:
+        target = action.element_name.strip().casefold()
+        candidates = [element for element in candidates if element.name.strip().casefold() == target]
+    candidates = [element for element in candidates if element.visible and element.enabled]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def inspect_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> Dict[str, Any]:
     """Return a non-destructive safety and readiness report for a workflow."""
     valid, reason = validate_workflow(workflow, screen_size)
@@ -1024,8 +1048,10 @@ class LocalAIClient:
             raise ValueError("업무 목표는 최대 4,000자까지 입력할 수 있습니다.")
         system = (
             "당신은 Windows 데스크톱 업무 자동화의 계획기입니다. "
-            "반드시 관찰 JSON의 elements에 실제로 존재하는 element_id만 사용하십시오. "
-            "좌표를 생성하거나 추측하지 말고, element_id가 없거나 확신이 낮으면 action=none을 반환하십시오. "
+            "반드시 관찰 JSON의 elements에 실제로 존재하는 element_id를 우선 사용하십시오. "
+            "각 UI 동작에는 가능하면 element_role, element_name, element_control_type도 함께 복사하십시오. "
+            "실행 직전 화면이 갱신될 수 있으므로 element_id가 바뀌더라도 세 의미 단서로 하나의 요소만 특정될 때만 안전하게 재바인딩합니다. "
+            "좌표를 생성하거나 추측하지 말고, 식별 단서가 없거나 확신이 낮으면 action=none을 반환하십시오. "
             "허용 action은 click, double_click, type, hotkey, scroll, wait, none뿐입니다. "
             "파일 삭제, 명령 셸, 결제, 전송, 게시, 로그인 정보 입력, 결재는 계획하지 마십시오. "
             "제출·삭제·저장 덮어쓰기·권한 변경처럼 위험한 동작은 requires_confirmation=true로 설정하십시오. "
@@ -1144,9 +1170,11 @@ def validate_ai_steps(
         if action.action in {"click", "double_click", "type"}:
             if not action.element_id:
                 return False, f"{index}번째 단계에 element_id가 없습니다. 좌표 직접 지정은 허용하지 않습니다."
-            element = element_map.get(action.element_id)
+            element = resolve_observed_element(action, observation)
             if element is None:
-                return False, f"{index}번째 단계의 element_id가 현재 화면에 없습니다."
+                return False, f"{index}번째 단계의 UI 요소가 현재 화면에 없습니다 또는 하나로 특정할 수 없습니다."
+            if element.id != action.element_id:
+                append_log(f"AI 요소 의미 기반 재바인딩: {action.element_id} -> {element.id}", "WARNING")
             if not element.visible or not element.enabled:
                 return False, f"{index}번째 단계의 UI 요소가 보이지 않거나 비활성 상태입니다."
             if len(element.bbox) != 4 or element.bbox[2] <= element.bbox[0] or element.bbox[3] <= element.bbox[1]:
