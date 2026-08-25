@@ -55,9 +55,9 @@ try:
 except ImportError:
     from app.adapters import build_document_context, normalize_document_roots
 try:
-    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile
+    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile, review_plan
 except ImportError:
-    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile
+    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile, review_plan
 
 try:
     import pyautogui
@@ -1021,14 +1021,21 @@ class AutoWorkAgent(tk.Tk):
             "이미지": observation.get("image_path", ""),
         }
         self._set_text(self.observation_text, self._pretty_json(obs_display))
-        self._set_text(self.plan_text, self._pretty_json(plan))
+        review = review_plan(plan, self._current_policy_profile())
+        plan_display = {"plan": plan, "preflight_review": review}
+        self._set_text(self.plan_text, self._pretty_json(plan_display))
         valid, reason = validate_ai_steps(plan, tuple(observation.get("screen_size", [100000, 100000])), observation, self._current_policy_profile())
-        if valid and plan.get("steps"):
+        if valid and review["ok"] and plan.get("steps"):
             self.execute_plan_button.configure(state="normal")
-            self._set_status(f"AI 계획 준비 완료 · 위험도 {plan.get('risk', 'unknown')}")
+            self._set_status(
+                f"AI 계획 준비 완료 · {review['step_count']}단계 · "
+                f"대기 {review['total_wait_seconds']:.1f}/{review['max_total_wait_seconds']:.0f}초 · "
+                f"위험도 {plan.get('risk', 'unknown')}"
+            )
         else:
             self.execute_plan_button.configure(state="disabled")
-            self._set_status(f"AI 계획 검토 필요 · {reason}")
+            details = " / ".join(review["warnings"][:2]) or reason
+            self._set_status(f"AI 계획 검토 필요 · {details}")
 
     def _execute_ai_plan(self) -> None:
         if not self.last_plan:
@@ -1049,8 +1056,22 @@ class AutoWorkAgent(tk.Tk):
         steps = self.last_plan.get("steps", [])
         summary = self.last_plan.get("summary", "요약 없음")
         risk = self.last_plan.get("risk", "unknown")
+        review = review_plan(self.last_plan, self._current_policy_profile())
+        if not review["ok"]:
+            self._ai_job_lock.release()
+            messagebox.showerror("AI 계획 정책 위반", "\n".join(review["warnings"]) or review["policy_message"])
+            return
+        action_summary = ", ".join(f"{name} {count}회" for name, count in review["action_counts"].items()) or "없음"
+        risk_summary = ", ".join(f"{name} {count}회" for name, count in review["risk_counts"].items()) or "없음"
         preview = "\n".join(f"{i}. {s.get('action')} · {s.get('reason', '')}" for i, s in enumerate(steps, 1))
-        if not messagebox.askyesno("AI 계획 실행 최종 확인", f"요약: {summary}\n위험도: {risk}\n\n{preview}\n\n실행하시겠습니까?"):
+        confirmation = (
+            f"요약: {summary}\n위험도: {risk}\n"
+            f"단계: {review['step_count']}개 / 최대 {review['max_steps']}개\n"
+            f"동작: {action_summary}\n위험 분류: {risk_summary}\n"
+            f"총 대기: {review['total_wait_seconds']:.1f}초 / 최대 {review['max_total_wait_seconds']:.0f}초\n"
+            f"결과 확인 문구: {review['expected_check_count']}개\n\n{preview}\n\n실행하시겠습니까?"
+        )
+        if not messagebox.askyesno("AI 계획 실행 최종 확인", confirmation):
             self._ai_job_lock.release()
             return
         append_execution_history(

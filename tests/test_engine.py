@@ -6,7 +6,7 @@ import pytest
 
 from app import engine
 from app.adapters import build_adapter_context, build_document_context, detect_application, normalize_document_roots, normalize_excel_cell_reference, search_approved_documents, validate_pdf_page_number
-from app.policies import validate_plan_policy
+from app.policies import review_plan, validate_plan_policy
 from app.engine import (
     LocalAIClient,
     LocalScheduler,
@@ -141,6 +141,42 @@ def test_policy_profiles_block_unsafe_actions():
     valid, message = validate_plan_policy(too_many, "public_document")
     assert valid is False
     assert "최대 12단계" in message
+
+
+def test_review_plan_summarizes_actions_risks_wait_and_expected_checks():
+    plan = {
+        "steps": [
+            {"action": "click", "risk": "read", "requires_confirmation": True, "expected_texts": ["완료"]},
+            {"action": "wait", "seconds": 2.5, "risk": "read", "requires_confirmation": True},
+            {"action": "scroll", "amount": -3, "risk": "read", "requires_confirmation": True},
+        ]
+    }
+    review = review_plan(plan, "browser")
+    assert review["ok"] is True
+    assert review["step_count"] == 3
+    assert review["action_counts"] == {"click": 1, "scroll": 1, "wait": 1}
+    assert review["risk_counts"] == {"read": 3}
+    assert review["total_wait_seconds"] == 2.5
+    assert review["expected_check_count"] == 1
+    assert review["warnings"] == []
+
+
+def test_review_plan_explains_policy_violation():
+    plan = {"steps": [{"action": "type", "risk": "write", "requires_confirmation": True}]}
+    review = review_plan(plan, "public_document")
+    assert review["ok"] is False
+    assert review["policy_message"]
+    assert review["warnings"]
+    assert "허용하지 않습니다" in review["warnings"][0]
+
+
+def test_review_plan_rejects_malformed_steps_and_waits():
+    malformed = review_plan({"steps": ["not-an-action"]}, "standard")
+    assert malformed["ok"] is False
+    assert "형식이 올바르지 않습니다" in malformed["policy_message"]
+    invalid_wait = review_plan({"steps": [{"action": "wait", "seconds": "nan", "risk": "read"}]}, "standard")
+    assert invalid_wait["ok"] is False
+    assert "대기시간" in invalid_wait["policy_message"]
 
 
 def test_validate_ai_steps_applies_policy_profile():
