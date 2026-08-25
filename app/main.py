@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import time
 import tkinter as tk
@@ -869,9 +870,11 @@ class AutoWorkAgent(tk.Tk):
         threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True).start()
 
     def _play_workflow_worker(self, workflow: Workflow, start_index: int = 0) -> None:
+        run_id = secrets.token_hex(8)
+        started_at = time.monotonic()
         recorded_size = workflow.recorded_screen_size
         size_text = f"{recorded_size[0]}x{recorded_size[1]}" if recorded_size else ""
-        append_execution_history("playback_started", workflow, screen_size=size_text, start_step=start_index + 1)
+        append_execution_history("playback_started", workflow, screen_size=size_text, start_step=start_index + 1, run_id=run_id)
         try:
             self.player.play(workflow, start_index=start_index)
             failure = self.player.failed or self.player.last_error
@@ -881,17 +884,19 @@ class AutoWorkAgent(tk.Tk):
                     workflow,
                     last_step=self.player.failure_index or self.player.current_index,
                     error=type(failure).__name__,
+                    run_id=run_id,
+                    duration_seconds=round(time.monotonic() - started_at, 3),
                 )
             else:
                 event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
-                append_execution_history(event, workflow, last_step=self.player.current_index)
+                append_execution_history(event, workflow, last_step=self.player.current_index, run_id=run_id, duration_seconds=round(time.monotonic() - started_at, 3))
                 clear_execution_checkpoint()
                 self._pending_checkpoint = None
                 self.last_failed_step_index = None
                 self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
                 self.after(0, lambda: self.recover_checkpoint_button.configure(state="disabled"))
         except Exception as exc:
-            append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__)
+            append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__, run_id=run_id, duration_seconds=round(time.monotonic() - started_at, 3))
             save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
             self._pending_checkpoint = load_execution_checkpoint()
             report_path = self._handle_exception("작업 재생", exc)
