@@ -137,6 +137,10 @@ def test_policy_profiles_block_unsafe_actions():
     assert "허용하지 않습니다" in message
     valid, message = validate_plan_policy({"steps": [{"action": "click", "risk": "read", "requires_confirmation": True}]}, "browser")
     assert valid is True
+    too_many = {"steps": [{"action": "wait", "seconds": 1, "risk": "read", "requires_confirmation": True}] * 13}
+    valid, message = validate_plan_policy(too_many, "public_document")
+    assert valid is False
+    assert "최대 12단계" in message
 
 
 def test_validate_ai_steps_applies_policy_profile():
