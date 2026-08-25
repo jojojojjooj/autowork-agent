@@ -33,6 +33,7 @@ from engine import (
     WorkflowPlayer,
     append_log,
     append_execution_history,
+    build_execution_report_dashboard,
     compare_prompt_templates,
     list_prompt_template_versions,
     write_execution_report,
@@ -337,6 +338,7 @@ class AutoWorkAgent(tk.Tk):
         top.pack(fill="x", pady=(0, 10))
         ttk.Button(top, text="로그 새로고침", command=self._refresh_log_view).pack(side="left")
         ttk.Button(top, text="실행 이력 새로고침", command=self._refresh_history_view).pack(side="left", padx=6)
+        ttk.Button(top, text="실행 리포트 새로고침", command=self._refresh_report_view).pack(side="left", padx=6)
         ttk.Button(top, text="운영 상태 새로고침", command=self._refresh_monitor_view).pack(side="left", padx=6)
         ttk.Button(top, text="지원 패키지 저장", command=self._export_support_bundle).pack(side="left", padx=6)
         ttk.Button(top, text="로그 폴더 열기", command=self._open_log_folder).pack(side="left", padx=6)
@@ -370,8 +372,16 @@ class AutoWorkAgent(tk.Tk):
         history_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=self.history_text.yview)
         self.history_text.configure(yscrollcommand=history_scroll.set)
         history_scroll.pack(side="right", fill="y")
+        report_frame = ttk.LabelFrame(body, text="실행 리포트 대시보드(입력·단계 원문 제외)", style="Card.TLabelframe")
+        body.add(report_frame, weight=2)
+        self.report_text = tk.Text(report_frame, wrap="word", state="disabled", font=("Consolas", 9))
+        self.report_text.pack(side="left", fill="both", expand=True)
+        report_scroll = ttk.Scrollbar(report_frame, orient="vertical", command=self.report_text.yview)
+        self.report_text.configure(yscrollcommand=report_scroll.set)
+        report_scroll.pack(side="right", fill="y")
         self._refresh_log_view()
         self._refresh_history_view()
+        self._refresh_report_view()
         self._refresh_monitor_view()
         self.after(30_000, self._monitor_heartbeat)
 
@@ -400,6 +410,32 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             text = f"실행 이력을 읽을 수 없습니다: {exc}"
         self._set_text(self.history_text, text)
+
+    def _refresh_report_view(self) -> None:
+        if not hasattr(self, "report_text"):
+            return
+        try:
+            dashboard = build_execution_report_dashboard(limit=20)
+            summary = dashboard.get("summary", {})
+            success_rate = "-" if summary.get("success_rate") is None else f"{summary['success_rate']:.1f}%"
+            failure_patterns = summary.get("failure_patterns", [])
+            workflow_patterns = summary.get("workflow_failure_patterns", [])
+            failure_text = ", ".join(f"{item.get('error_type')}({item.get('count')})" for item in failure_patterns) or "없음"
+            workflow_text = ", ".join(f"{item.get('workflow')}({item.get('count')})" for item in workflow_patterns) or "없음"
+            lines = [
+                f"요약 · 리포트 {summary.get('total_reports', 0)} · 완료 {summary.get('completed_runs', 0)} · "
+                f"실패 {summary.get('failed_runs', 0)} · 중지 {summary.get('stopped_runs', 0)} · 성공률 {success_rate}",
+                f"주요 오류 유형: {failure_text}",
+                f"실패 작업: {workflow_text}",
+                "",
+                "최근 리포트(입력값·단계 원문 제외):",
+            ]
+            safe_fields = ("created_at", "run_id", "event", "mode", "workflow", "last_step", "duration_seconds", "error_type", "policy_profile")
+            for report in dashboard.get("recent_reports", []):
+                lines.append(json.dumps({field_name: report.get(field_name) for field_name in safe_fields}, ensure_ascii=False))
+            self._set_text(self.report_text, "\n".join(lines))
+        except Exception as exc:
+            self._set_text(self.report_text, f"실행 리포트를 읽을 수 없습니다: {exc}")
 
     def _refresh_monitor_view(self, status_override: Optional[str] = None) -> None:
         if not hasattr(self, "monitor_status_var"):

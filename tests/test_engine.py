@@ -17,6 +17,7 @@ from app.engine import (
     append_execution_history,
     backup_workflow,
     build_monitor_snapshot,
+    build_execution_report_dashboard,
     cleanup_workflow_backups,
     evaluate_monitor_alerts,
     export_support_bundle,
@@ -25,6 +26,8 @@ from app.engine import (
     save_execution_checkpoint,
     list_workflow_backups,
     read_monitor_snapshot,
+    read_execution_reports,
+    summarize_execution_reports,
     write_monitor_snapshot,
     mask_sensitive_text,
     read_execution_history,
@@ -671,3 +674,25 @@ def test_execution_report_rotation_and_directory_creation(tmp_path: Path, monkey
         assert write_execution_report(f"rotation-{index}", "playback_completed", workflow)
         time.sleep(0.002)
     assert len(list(engine.RUN_REPORT_DIR.glob("run_*.json"))) == 2
+
+
+def test_execution_report_dashboard_summarizes_failures_without_sensitive_fields(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "RUN_REPORT_DIR", tmp_path / "app" / "run_reports")
+    workflow = Workflow(name="대시보드 작업", steps=[Step(type="key", value="입력 비밀")])
+    write_execution_report("completed", "playback_completed", workflow, mode="playback")
+    write_execution_report("failed-a", "playback_failed", workflow, mode="playback", error_type="WindowGuardError")
+    write_execution_report("failed-b", "ai_plan_failed", workflow, mode="ai_plan", error_type="WindowGuardError")
+    write_execution_report("stopped", "playback_stopped", workflow, mode="playback")
+    reports = read_execution_reports()
+    assert len(reports) == 4
+    assert all("steps" not in item and "value" not in item for item in reports)
+    summary = summarize_execution_reports(reports)
+    assert summary["completed_runs"] == 1
+    assert summary["failed_runs"] == 2
+    assert summary["stopped_runs"] == 1
+    assert summary["success_rate"] == 33.3
+    assert summary["failure_patterns"] == [{"error_type": "WindowGuardError", "count": 2}]
+    dashboard = build_execution_report_dashboard(limit=2)
+    assert len(dashboard["recent_reports"]) == 2
+    assert dashboard["summary"]["total_reports"] == 4

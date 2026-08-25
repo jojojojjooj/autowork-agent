@@ -495,6 +495,70 @@ def write_execution_report(
         return None
 
 
+def read_execution_reports(limit: int = 100) -> List[Dict[str, Any]]:
+    """Read bounded local execution summaries using a strict non-sensitive field allowlist."""
+    ensure_app_dirs()
+    try:
+        count = max(1, min(int(limit), MAX_RUN_REPORTS))
+    except (TypeError, ValueError):
+        count = MAX_RUN_REPORTS
+    reports: List[Dict[str, Any]] = []
+    fields = (
+        "version", "created_at", "run_id", "event", "mode", "workflow", "step_count",
+        "start_step", "last_step", "duration_seconds", "error_type", "policy_profile",
+    )
+    for path in sorted(RUN_REPORT_DIR.glob("run_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:count]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("version") != 1:
+                continue
+            record = {field_name: data.get(field_name) for field_name in fields}
+            record["report_file"] = path.name
+            reports.append(redact_sensitive(record))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            continue
+    return reports
+
+
+def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Summarize terminal run reports and bounded failure patterns without workflow inputs."""
+    items = reports if reports is not None else read_execution_reports(MAX_RUN_REPORTS)
+    completed_events = {"playback_completed", "ai_plan_completed", "ai_plan_dry_run_completed"}
+    failed_events = [item for item in items if str(item.get("event", "")).endswith("_failed")]
+    completed = sum(1 for item in items if item.get("event") in completed_events)
+    stopped = sum(1 for item in items if str(item.get("event", "")).endswith("_stopped"))
+    terminal_runs = completed + len(failed_events)
+    error_counts = Counter(str(item.get("error_type", "")).strip() for item in failed_events if str(item.get("error_type", "")).strip())
+    workflow_counts = Counter(str(item.get("workflow", "")).strip() for item in failed_events if str(item.get("workflow", "")).strip())
+    mode_counts = Counter(str(item.get("mode", "unknown")) for item in items)
+    return {
+        "total_reports": len(items),
+        "completed_runs": completed,
+        "failed_runs": len(failed_events),
+        "stopped_runs": stopped,
+        "terminal_runs": terminal_runs,
+        "success_rate": round((completed / terminal_runs) * 100, 1) if terminal_runs else None,
+        "event_counts": dict(Counter(str(item.get("event", "unknown")) for item in items)),
+        "mode_counts": dict(mode_counts),
+        "failure_patterns": [{"error_type": name, "count": count} for name, count in error_counts.most_common(10)],
+        "workflow_failure_patterns": [{"workflow": name, "count": count} for name, count in workflow_counts.most_common(10)],
+        "last_report_at": items[0].get("created_at") if items else None,
+    }
+
+
+def build_execution_report_dashboard(limit: int = 20) -> Dict[str, Any]:
+    """Build a local dashboard payload containing only report summaries and recent safe fields."""
+    reports = read_execution_reports(MAX_RUN_REPORTS)
+    try:
+        recent_limit = max(1, min(int(limit), MAX_RUN_REPORTS))
+    except (TypeError, ValueError):
+        recent_limit = 20
+    return {
+        "summary": summarize_execution_reports(reports),
+        "recent_reports": reports[:recent_limit],
+    }
+
+
 def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workflow_signature: str = "", mode: str = "playback", error_type: str = "") -> None:
     """Persist only resumable metadata; never persist workflow steps or typed input."""
     if workflow_path is None:
