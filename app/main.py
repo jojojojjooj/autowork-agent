@@ -73,6 +73,7 @@ class AutoWorkAgent(tk.Tk):
         self.hotkey_listener = None
         self.ai_stop_event = threading.Event()
         self.ai_running = False
+        self.ai_planning = False
         self.last_ai_index = 0
         self.dry_run_enabled = True
         self.capture_on_error_enabled = True
@@ -635,8 +636,16 @@ class AutoWorkAgent(tk.Tk):
         append_execution_history("playback_started", self.workflow, screen_size=size_text)
         try:
             self.player.play(self.workflow)
-            event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
-            append_execution_history(event, self.workflow, last_step=self.player.current_index)
+            if self.player.failed is not None:
+                append_execution_history(
+                    "playback_failed",
+                    self.workflow,
+                    last_step=self.player.failure_index,
+                    error=type(self.player.failed).__name__,
+                )
+            else:
+                event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
+                append_execution_history(event, self.workflow, last_step=self.player.current_index)
         except Exception as exc:
             append_execution_history("playback_failed", self.workflow, last_step=self.player.current_index, error=type(exc).__name__)
             raise
@@ -679,8 +688,8 @@ class AutoWorkAgent(tk.Tk):
             messagebox.showerror("불러오기 실패", str(exc))
 
     def _make_ai_plan(self) -> None:
-        if self.ai_running:
-            messagebox.showwarning("AI 실행 중", "현재 AI 계획을 먼저 중지하거나 완료하세요.")
+        if self.ai_running or self.ai_planning:
+            messagebox.showwarning("AI 실행 중", "현재 AI 작업이 끝난 뒤 다시 시도하세요.")
             return
         goal = self.goal_text.get("1.0", "end").strip()
         if not goal:
@@ -698,6 +707,7 @@ class AutoWorkAgent(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("설정값 오류", str(exc))
             return
+        self.ai_planning = True
         self.execute_plan_button.configure(state="disabled")
         self._set_status("화면 관찰 및 로컬 AI 계획 생성 중…")
         threading.Thread(target=self._agent_worker, args=(goal, settings), daemon=True).start()
@@ -716,6 +726,9 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal)})
             self.after(0, lambda: self._agent_failed(exc, report_path))
+        finally:
+            self.ai_planning = False
+            self.after(0, lambda: self.execute_plan_button.configure(state="normal"))
 
     def _agent_failed(self, error: BaseException, report_path: Optional[Path]) -> None:
         self._set_status("AI 계획 생성 실패")
@@ -951,7 +964,13 @@ class AutoWorkAgent(tk.Tk):
                 "capture_on_error": bool(self.capture_on_error_var.get()),
                 "dry_run": bool(self.dry_run_var.get()),
             }
-            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.tmp")
+            try:
+                temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(temporary, CONFIG_PATH)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
             self._set_status("로컬 AI 설정 저장 완료")
         except Exception as exc:
             messagebox.showerror("설정 저장 실패", str(exc))

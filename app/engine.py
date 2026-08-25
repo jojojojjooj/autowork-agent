@@ -46,6 +46,8 @@ WORKFLOW_VERSION = 2
 MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
 MAX_WORKFLOW_STEPS = 10_000
 MAX_TEXT_INPUT_LENGTH = 100_000
+MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
+MAX_HISTORY_RECORDS_ON_ROTATE = 1_000
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
 
@@ -74,6 +76,11 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
     line = json.dumps(record, ensure_ascii=False) + "\n"
     try:
         with _HISTORY_LOCK:
+            if HISTORY_PATH.exists() and HISTORY_PATH.stat().st_size >= MAX_HISTORY_FILE_BYTES:
+                previous = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+                temporary = HISTORY_PATH.with_name(f".{HISTORY_PATH.name}.tmp")
+                temporary.write_text("\n".join(previous[-MAX_HISTORY_RECORDS_ON_ROTATE:]) + "\n", encoding="utf-8")
+                os.replace(temporary, HISTORY_PATH)
             with HISTORY_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(line)
     except OSError as exc:
@@ -502,6 +509,8 @@ class WorkflowPlayer:
         self.running = False
         self.current_index = 0
         self.current_step: Optional[Step] = None
+        self.failed: Optional[BaseException] = None
+        self.failure_index = 0
         self._pressed_keys: set[str] = set()
 
     @property
@@ -655,6 +664,8 @@ class WorkflowPlayer:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
         self.stop_event.clear()
         self.pause_event.clear()
+        self.failed = None
+        self.failure_index = 0
         self.running = True
         try:
             pyautogui.PAUSE = 0.03
@@ -679,6 +690,8 @@ class WorkflowPlayer:
                 if self.on_status:
                     self.on_status(f"재생 중: {index}/{total}")
         except Exception as exc:
+            self.failed = exc
+            self.failure_index = self.current_index
             if self.on_error and self.current_step is not None:
                 self.on_error(exc, self.current_index, self.current_step)
             else:
