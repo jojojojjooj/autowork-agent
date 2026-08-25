@@ -415,9 +415,14 @@ class AutoWorkAgent(tk.Tk):
             alerts = snapshot.get("alerts", [])
             alert_text = " / ".join(str(item.get("message", "")) for item in alerts[:3]) or "현재 경보 없음"
             summary = snapshot.get("summary", {})
+            integrity = snapshot.get("audit_integrity", {})
+            integrity_text = "정상" if integrity.get("valid") else "검증 실패"
+            if integrity.get("legacy_records"):
+                integrity_text += f" · 레거시 {integrity['legacy_records']}건"
             self.monitor_status_var.set(
                 f"운영 모니터: {snapshot.get('heartbeat_at', '-')} · 상태 {snapshot.get('status', '-')} · "
-                f"성공률 {summary.get('success_rate', '-')} · 경보 {len(alerts)}개 · {alert_text}"
+                f"성공률 {summary.get('success_rate', '-')} · 감사 {integrity_text} · "
+                f"경보 {len(alerts)}개 · {alert_text}"
             )
         except Exception as exc:
             self.monitor_status_var.set(f"운영 모니터 오류: {exc}")
