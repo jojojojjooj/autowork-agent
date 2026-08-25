@@ -16,6 +16,9 @@ from app.engine import (
     append_execution_history,
     backup_workflow,
     cleanup_workflow_backups,
+    clear_execution_checkpoint,
+    load_execution_checkpoint,
+    save_execution_checkpoint,
     list_workflow_backups,
     mask_sensitive_text,
     read_execution_history,
@@ -57,6 +60,21 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
     assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_execution_checkpoint_roundtrip(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "CHECKPOINT_PATH", tmp_path / "app" / "checkpoint.json")
+    workflow_path = tmp_path / "job.json"
+    workflow_path.write_text("{}", encoding="utf-8")
+    save_execution_checkpoint(workflow_path, 2, "a" * 64, mode="playback", error_type="RuntimeError")
+    checkpoint = load_execution_checkpoint()
+    assert checkpoint is not None
+    assert checkpoint["next_index"] == 2
+    assert checkpoint["workflow_signature"] == "a" * 64
+    assert "steps" not in checkpoint
+    clear_execution_checkpoint()
+    assert load_execution_checkpoint() is None
 
 
 def test_workflow_backup_is_created_and_bounded(tmp_path: Path, monkeypatch):

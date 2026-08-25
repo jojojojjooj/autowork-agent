@@ -48,6 +48,7 @@ HISTORY_PATH = APP_DIR / "execution_history.jsonl"
 WORKFLOW_KEY_PATH = APP_DIR / "workflow.key"
 LOG_PATH = APP_DIR / "autowork.log"
 CONFIG_PATH = APP_DIR / "config.json"
+CHECKPOINT_PATH = APP_DIR / "execution_checkpoint.json"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WORKFLOW_VERSION = 2
 MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
@@ -60,6 +61,7 @@ MAX_CAPTURE_AGE_DAYS = 30
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
 MAX_WORKFLOW_BACKUPS = 20
+CHECKPOINT_VERSION = 1
 SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
 PII_PATTERNS = (
     (re.compile(r"(?<!\d)\d{6}[- ]\d{7}(?!\d)"), "<주민번호 마스킹>"),
@@ -270,6 +272,66 @@ def summarize_execution_history(records: Optional[List[Dict[str, Any]]] = None) 
         "events": dict(events),
         "last_event": items[-1].get("event") if items else None,
     }
+
+
+def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workflow_signature: str = "", mode: str = "playback", error_type: str = "") -> None:
+    """Persist only resumable metadata; never persist workflow steps or typed input."""
+    if workflow_path is None:
+        return
+    try:
+        index = max(0, int(next_index))
+    except (TypeError, ValueError):
+        return
+    ensure_app_dirs()
+    payload = {
+        "version": CHECKPOINT_VERSION,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "workflow_path": str(Path(workflow_path).resolve())[:1_000],
+        "workflow_signature": str(workflow_signature or "")[:64],
+        "next_index": index,
+        "mode": str(mode)[:40],
+        "error_type": str(error_type)[:120],
+    }
+    temporary = CHECKPOINT_PATH.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, CHECKPOINT_PATH)
+    except OSError as exc:
+        append_log(f"실행 체크포인트 저장 실패: {exc}", "WARNING")
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_execution_checkpoint() -> Optional[Dict[str, Any]]:
+    """Load and validate resumable metadata, returning None for stale/corrupt state."""
+    if not CHECKPOINT_PATH.exists():
+        return None
+    try:
+        data = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != CHECKPOINT_VERSION:
+            return None
+        path = Path(str(data.get("workflow_path", "")))
+        next_index = int(data.get("next_index", 0))
+        if not path.is_file() or not 0 <= next_index <= MAX_WORKFLOW_STEPS:
+            return None
+        return {
+            "version": CHECKPOINT_VERSION,
+            "saved_at": str(data.get("saved_at", ""))[:40],
+            "workflow_path": str(path),
+            "workflow_signature": str(data.get("workflow_signature", ""))[:64],
+            "next_index": next_index,
+            "mode": str(data.get("mode", "playback"))[:40],
+            "error_type": str(data.get("error_type", ""))[:120],
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def clear_execution_checkpoint() -> None:
+    try:
+        CHECKPOINT_PATH.unlink(missing_ok=True)
+    except OSError as exc:
+        append_log(f"실행 체크포인트 삭제 실패: {exc}", "WARNING")
 
 
 def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None, mask_sensitive: bool = True) -> Path:

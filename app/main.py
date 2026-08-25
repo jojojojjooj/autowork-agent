@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from engine import (
     APP_DIR,
     BACKUP_DIR,
+    CHECKPOINT_PATH,
     CONFIG_PATH,
     HISTORY_PATH,
     DEBUG_DIR,
@@ -43,6 +44,9 @@ from engine import (
     write_error_report,
     load_workflow,
     save_workflow,
+    save_execution_checkpoint,
+    load_execution_checkpoint,
+    clear_execution_checkpoint,
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
@@ -81,6 +85,7 @@ class AutoWorkAgent(tk.Tk):
         super().__init__()
         ensure_app_dirs()
         cleanup_expired_artifacts()
+        self._pending_checkpoint = load_execution_checkpoint()
         self.title("AutoWork Agent · 로컬 데스크톱 자동화")
         self.geometry("1060x760")
         self.minsize(900, 620)
@@ -166,6 +171,9 @@ class AutoWorkAgent(tk.Tk):
         ttk.Button(top, text="안전 점검", command=self._inspect_current_workflow).pack(side="left", padx=(12, 0))
         self.resume_play_button = ttk.Button(top, text="실패 단계부터 재개", command=self._resume_failed_workflow, state="disabled")
         self.resume_play_button.pack(side="left", padx=6)
+        checkpoint_state = "normal" if self._pending_checkpoint else "disabled"
+        self.recover_checkpoint_button = ttk.Button(top, text="재시작 복구", command=self._recover_checkpoint, state=checkpoint_state)
+        self.recover_checkpoint_button.pack(side="left", padx=6)
         ttk.Button(top, text="템플릿 저장", command=self._save_template).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="템플릿 불러오기", command=self._load_template).pack(side="right")
         ttk.Button(top, text="백업 복원", command=self._restore_workflow_backup).pack(side="right", padx=(6, 0))
@@ -425,6 +433,10 @@ class AutoWorkAgent(tk.Tk):
         if hasattr(self, "resume_play_button"):
             self.after(0, lambda: self.resume_play_button.configure(state="normal"))
         failure_context = {"failed_step": index, "step": redact_sensitive(step.__dict__), "error_type": type(exc).__name__, "error": str(exc)[:1200]}
+        save_execution_checkpoint(self.current_path, index - 1, self.workflow.signature or "", error_type=type(exc).__name__)
+        self._pending_checkpoint = load_execution_checkpoint()
+        if hasattr(self, "recover_checkpoint_button"):
+            self.after(0, lambda: self.recover_checkpoint_button.configure(state="normal"))
         report_path = self._handle_exception("작업 재생", exc, failure_context)
         self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
         self.after(0, lambda: self._offer_recovery_plan(failure_context))
@@ -759,6 +771,35 @@ class AutoWorkAgent(tk.Tk):
             if not self._step_gate.wait(timeout=300):
                 self.player.stop()
 
+    def _recover_checkpoint(self) -> None:
+        checkpoint = load_execution_checkpoint()
+        if not checkpoint:
+            self._pending_checkpoint = None
+            self.recover_checkpoint_button.configure(state="disabled")
+            messagebox.showinfo("복구할 체크포인트 없음", "유효한 실행 체크포인트가 없습니다.")
+            return
+        path = Path(checkpoint["workflow_path"])
+        try:
+            require_signature = bool(checkpoint.get("workflow_signature"))
+            workflow = load_workflow(path, require_signature=require_signature)
+            saved_signature = str(checkpoint.get("workflow_signature", ""))
+            if saved_signature and workflow.signature != saved_signature:
+                raise ValueError("체크포인트의 Workflow 서명이 현재 파일과 다릅니다.")
+            start_index = int(checkpoint["next_index"])
+            if not 0 <= start_index < len(workflow.steps):
+                raise ValueError("체크포인트의 재개 단계가 현재 Workflow 범위를 벗어났습니다.")
+            self.workflow = workflow
+            self.current_path = path
+            self.workflow_name_var.set(workflow.name)
+            self._refresh_steps()
+            self.last_failed_step_index = start_index
+            self._resume_failed_workflow()
+        except Exception as exc:
+            clear_execution_checkpoint()
+            self._pending_checkpoint = None
+            self.recover_checkpoint_button.configure(state="disabled")
+            messagebox.showerror("체크포인트 복구 실패", str(exc))
+
     def _resume_failed_workflow(self) -> None:
         start_index = self.last_failed_step_index
         if start_index is None:
@@ -844,10 +885,15 @@ class AutoWorkAgent(tk.Tk):
             else:
                 event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
                 append_execution_history(event, workflow, last_step=self.player.current_index)
+                clear_execution_checkpoint()
+                self._pending_checkpoint = None
                 self.last_failed_step_index = None
                 self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
+                self.after(0, lambda: self.recover_checkpoint_button.configure(state="disabled"))
         except Exception as exc:
             append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__)
+            save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
+            self._pending_checkpoint = load_execution_checkpoint()
             report_path = self._handle_exception("작업 재생", exc)
             self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
         finally:
@@ -922,6 +968,10 @@ class AutoWorkAgent(tk.Tk):
             self.current_path = Path(path)
             self._refresh_steps()
             signature_status = "서명 확인" if verify_workflow_signature(self.workflow) else "레거시 작업(서명 없음)"
+            checkpoint = load_execution_checkpoint()
+            if checkpoint and Path(checkpoint.get("workflow_path", "")) != self.current_path:
+                self._pending_checkpoint = None
+                self.recover_checkpoint_button.configure(state="disabled")
             self._set_status(f"불러오기 완료 · {self.current_path.name} · {signature_status}")
         except Exception as exc:
             messagebox.showerror("불러오기 실패", str(exc))
