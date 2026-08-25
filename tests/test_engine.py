@@ -14,6 +14,9 @@ from app.engine import (
     Workflow,
     WorkflowPlayer,
     append_execution_history,
+    backup_workflow,
+    cleanup_workflow_backups,
+    list_workflow_backups,
     mask_sensitive_text,
     read_execution_history,
     sign_workflow,
@@ -54,6 +57,20 @@ def test_workflow_roundtrip(tmp_path: Path):
     assert loaded.steps[0].x == 100
     assert loaded.steps[1].value == "a"
     assert loaded.recorded_screen_size == [1920, 1080]
+
+
+def test_workflow_backup_is_created_and_bounded(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "BACKUP_DIR", tmp_path / "app" / "workflow_backups")
+    workflow_path = tmp_path / "job.json"
+    workflow_path.write_text("{}", encoding="utf-8")
+    first = backup_workflow(workflow_path)
+    assert first is not None and first.exists()
+    for index in range(4):
+        workflow_path.write_text(str(index), encoding="utf-8")
+        backup_workflow(workflow_path)
+    cleanup_workflow_backups(2)
+    assert len(list_workflow_backups()) == 2
 
 
 def test_workflow_signature_detects_tampering(tmp_path: Path, monkeypatch):
@@ -366,6 +383,31 @@ def test_local_endpoint_allows_loopback_only():
         assert "로컬 LLM" in str(exc)
     else:
         raise AssertionError("외부 endpoint가 허용되었습니다.")
+
+
+def test_local_ai_health_check_reads_models_only(monkeypatch):
+    import requests
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "local-model"}]}
+
+    def fake_get(url, timeout):
+        calls.append((url, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    result = LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model", timeout=120).health_check()
+    assert result["reachable"] is True
+    assert result["models"] == ["local-model"]
+    assert calls == [("http://127.0.0.1:11434/v1/models", 5)]
 
 
 def test_workflow_is_saved_as_version_2_and_rejects_unsafe_steps(tmp_path: Path):

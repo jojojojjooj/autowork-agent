@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from engine import (
     APP_DIR,
+    BACKUP_DIR,
     CONFIG_PATH,
     HISTORY_PATH,
     DEBUG_DIR,
@@ -167,6 +168,7 @@ class AutoWorkAgent(tk.Tk):
         self.resume_play_button.pack(side="left", padx=6)
         ttk.Button(top, text="템플릿 저장", command=self._save_template).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="템플릿 불러오기", command=self._load_template).pack(side="right")
+        ttk.Button(top, text="백업 복원", command=self._restore_workflow_backup).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="선택 단계 삭제", command=self._delete_selected_step).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="저장", command=self._save_workflow).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="불러오기", command=self._load_workflow).pack(side="right")
@@ -288,7 +290,12 @@ class AutoWorkAgent(tk.Tk):
         ttk.Label(card, text="승인 문서 루트(;로 구분)", width=22).grid(row=6, column=0, sticky="w", pady=6)
         self.document_roots_var = tk.StringVar(value=";".join(str(item) for item in self._config_data.get("document_roots", []) if isinstance(item, str)))
         ttk.Entry(card, textvariable=self.document_roots_var, width=58).grid(row=6, column=1, sticky="w", pady=6)
-        ttk.Button(card, text="설정 저장", command=self._save_config).grid(row=7, column=1, sticky="w", pady=(10, 0))
+        settings_buttons = ttk.Frame(card)
+        settings_buttons.grid(row=7, column=1, sticky="w", pady=(10, 0))
+        ttk.Button(settings_buttons, text="설정 저장", command=self._save_config).pack(side="left")
+        ttk.Button(settings_buttons, text="연결 점검", command=self._check_ai_connection).pack(side="left", padx=6)
+        self.connection_status_var = tk.StringVar(value="연결 상태 확인 전")
+        ttk.Label(settings_buttons, textvariable=self.connection_status_var, style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Label(card, text="예약 실행 간격(초)", width=22).grid(row=8, column=0, sticky="w", pady=(18, 6))
         self.schedule_interval_var = tk.StringVar(value=str(self._config_data.get("schedule_interval", 3600)))
         ttk.Entry(card, textvariable=self.schedule_interval_var, width=18).grid(row=8, column=1, sticky="w", pady=(18, 6))
@@ -862,11 +869,45 @@ class AutoWorkAgent(tk.Tk):
         if not path:
             return
         try:
-            save_workflow(self.workflow, Path(path))
+            backup_path = save_workflow(self.workflow, Path(path))
             self.current_path = Path(path)
-            self._set_status(f"저장 완료 · {self.current_path.name}")
+            backup_note = f" · 백업 {backup_path.name}" if backup_path else ""
+            self._set_status(f"저장 완료 · {self.current_path.name}{backup_note}")
         except Exception as exc:
             messagebox.showerror("저장 실패", str(exc))
+
+    def _restore_workflow_backup(self) -> None:
+        backup_path = filedialog.askopenfilename(
+            title="Workflow 백업 복원",
+            initialdir=str(BACKUP_DIR),
+            filetypes=[("AutoWork 백업", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not backup_path:
+            return
+        target = self.current_path
+        if target is None:
+            target_name = filedialog.asksaveasfilename(
+                title="복원할 작업 파일 지정",
+                initialdir=str(WORKFLOW_DIR),
+                defaultextension=".json",
+                filetypes=[("AutoWork 작업", "*.json")],
+            )
+            if not target_name:
+                return
+            target = Path(target_name)
+        if not messagebox.askyesno("백업 복원 확인", f"다음 백업으로 현재 작업을 덮어쓸까요?\n\n{Path(backup_path).name}"):
+            return
+        try:
+            restored = load_workflow(Path(backup_path), require_signature=False)
+            save_workflow(restored, target)
+            self.workflow = restored
+            self.current_path = target
+            self.workflow_name_var.set(restored.name)
+            self._refresh_steps()
+            self._set_status(f"백업 복원 완료 · {target.name}")
+            append_execution_history("workflow_backup_restored", restored, source=Path(backup_path).name)
+        except Exception as exc:
+            messagebox.showerror("백업 복원 실패", str(exc))
 
     def _load_workflow(self) -> None:
         path = filedialog.askopenfilename(
@@ -1260,6 +1301,37 @@ class AutoWorkAgent(tk.Tk):
             self._set_status("로컬 AI 설정 저장 완료")
         except Exception as exc:
             messagebox.showerror("설정 저장 실패", str(exc))
+
+    def _check_ai_connection(self) -> None:
+        try:
+            client = LocalAIClient(
+                endpoint=self.endpoint_var.get().strip(),
+                model=self.model_var.get().strip(),
+                timeout=validate_timeout(self.timeout_var.get().strip()),
+                vision=bool(self.vision_var.get()),
+            )
+            self.connection_status_var.set("연결 점검 중...")
+            threading.Thread(target=self._check_ai_connection_worker, args=(client,), daemon=True, name="ai-health-check").start()
+        except Exception as exc:
+            self.connection_status_var.set("설정 오류")
+            messagebox.showerror("연결 점검 실패", str(exc))
+
+    def _check_ai_connection_worker(self, client: LocalAIClient) -> None:
+        try:
+            result = client.health_check()
+            self.after(0, lambda: self._show_ai_connection_result(client.model, result))
+        except Exception as exc:
+            self.after(0, lambda: self._show_ai_connection_error(exc))
+
+    def _show_ai_connection_result(self, model: str, result: Dict[str, Any]) -> None:
+        models = result.get("models", [])
+        self.connection_status_var.set(f"연결됨 · 모델 {len(models)}개")
+        model_note = f"\n현재 모델 '{model}'이 목록에 없습니다." if models and model not in models else ""
+        messagebox.showinfo("로컬 AI 연결 확인", f"서버 연결 성공\nHTTP 상태: {result.get('status_code')}\n모델 수: {len(models)}{model_note}")
+
+    def _show_ai_connection_error(self, exc: BaseException) -> None:
+        self.connection_status_var.set("연결 실패")
+        messagebox.showerror("로컬 AI 연결 실패", str(exc))
 
     def _start_scheduler(self) -> None:
         try:

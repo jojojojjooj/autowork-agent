@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import traceback
@@ -38,6 +39,7 @@ except Exception:  # pragma: no cover - Windows runtime dependency
 
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "AutoWorkAgent"
 WORKFLOW_DIR = APP_DIR / "workflows"
+BACKUP_DIR = APP_DIR / "workflow_backups"
 CACHE_DIR = APP_DIR / "cache"
 ERROR_DIR = APP_DIR / "errors"
 DEBUG_DIR = APP_DIR / "debug_snapshots"
@@ -57,6 +59,7 @@ MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
 MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
+MAX_WORKFLOW_BACKUPS = 20
 SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
 PII_PATTERNS = (
     (re.compile(r"(?<!\d)\d{6}[- ]\d{7}(?!\d)"), "<주민번호 마스킹>"),
@@ -1059,6 +1062,7 @@ def cleanup_expired_artifacts(max_age_days: int = MAX_CAPTURE_AGE_DAYS) -> None:
                     path.unlink()
             except OSError:
                 continue
+    cleanup_workflow_backups()
 
 
 def ensure_app_dirs() -> None:
@@ -1068,6 +1072,7 @@ def ensure_app_dirs() -> None:
     ERROR_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_screen_size() -> Optional[tuple[int, int]]:
@@ -1174,6 +1179,22 @@ class LocalAIClient:
             raise ValueError("로컬 AI 모델 이름을 입력하세요(최대 200자).")
         self.timeout = validate_timeout(timeout)
         self.vision = vision
+
+    def health_check(self) -> Dict[str, Any]:
+        """Check the local OpenAI-compatible server without sending user data."""
+        import requests
+
+        try:
+            response = requests.get(f"{self.endpoint}/models", timeout=min(self.timeout, 5))
+            response.raise_for_status()
+            payload = response.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            model_names = [str(item.get("id", "")) for item in models if isinstance(item, dict) and item.get("id")]
+            return {"reachable": True, "status_code": response.status_code, "models": model_names[:50]}
+        except requests.RequestException as exc:
+            raise RuntimeError(f"로컬 AI 서버에 연결할 수 없습니다: {exc}") from exc
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"로컬 AI 서버 응답 형식이 올바르지 않습니다: {exc}") from exc
 
     @staticmethod
     def _image_data_url(path: str) -> str:
@@ -1290,7 +1311,44 @@ class LocalAIClient:
             raise RetryableAutomationError(f"Gemma 구조화 계획 검증 실패: {exc}") from exc
 
 
-def save_workflow(workflow: Workflow, path: Path) -> None:
+def cleanup_workflow_backups(max_backups: int = MAX_WORKFLOW_BACKUPS) -> None:
+    """Keep the newest workflow backups while preserving the active workflow files."""
+    ensure_app_dirs()
+    try:
+        limit = max(1, int(max_backups))
+        backups = sorted((path for path in BACKUP_DIR.glob("*.json") if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in backups[limit:]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+    except (OSError, ValueError):
+        return
+
+
+def backup_workflow(path: Path) -> Optional[Path]:
+    """Create a timestamped local backup before an existing workflow is overwritten."""
+    source = Path(path)
+    if not source.exists() or not source.is_file():
+        return None
+    ensure_app_dirs()
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000_000:09d}"
+    digest = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()[:10]
+    target = BACKUP_DIR / f"{source.stem}_{stamp}_{digest}.json"
+    shutil.copy2(source, target)
+    cleanup_workflow_backups()
+    return target
+
+
+def list_workflow_backups(workflow_path: Path | None = None) -> List[Path]:
+    """List newest local workflow backups, optionally filtered by original stem."""
+    ensure_app_dirs()
+    stem = Path(workflow_path).stem if workflow_path else None
+    paths = [path for path in BACKUP_DIR.glob("*.json") if path.is_file() and (stem is None or path.name.startswith(f"{stem}_"))]
+    return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def save_workflow(workflow: Workflow, path: Path) -> Optional[Path]:
     ensure_app_dirs()
     if not isinstance(workflow, Workflow):
         raise TypeError("Workflow 객체만 저장할 수 있습니다.")
@@ -1300,6 +1358,7 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
     sign_workflow(workflow)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_workflow(path)
     payload = json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2)
     if len(payload.encode("utf-8")) > MAX_WORKFLOW_FILE_BYTES:
         raise ValueError("작업 파일이 너무 큽니다.")
@@ -1310,6 +1369,7 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+    return backup_path
 
 
 PROMPT_TEMPLATE_VERSION = 1
