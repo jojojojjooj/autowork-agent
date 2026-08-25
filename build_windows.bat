@@ -2,17 +2,16 @@
 setlocal
 cd /d "%~dp0"
 
-if not exist .venv (
-    echo Run run_windows.bat once first.
+if not exist .venv\READY.txt (
+    echo Run install_windows.bat first, including the approved offline wheel directory if required.
     pause
     exit /b 1
 )
 
 call .venv\Scripts\activate.bat
-python -m pip install --upgrade pyinstaller
 if errorlevel 1 goto :error
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name AutoWorkAgent --add-data "README.md;." app\main.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name AutoWorkAgent app\main.py
 if errorlevel 1 goto :error
 
 echo.

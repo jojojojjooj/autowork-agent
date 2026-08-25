@@ -1,0 +1,9 @@
+pynput==1.7.7
+PyAutoGUI==0.9.54
+Pillow==11.3.0
+requests==2.32.4
+pydantic==2.11.7
+pyperclip==1.9.0
+pywinauto==0.6.9
+pytesseract==0.3.13
+pyinstaller==6.14.2
