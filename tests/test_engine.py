@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from app import engine
-from app.adapters import build_adapter_context, detect_application, normalize_excel_cell_reference, validate_pdf_page_number
+from app.adapters import build_adapter_context, build_document_context, detect_application, normalize_document_roots, normalize_excel_cell_reference, search_approved_documents, validate_pdf_page_number
+from app.policies import validate_plan_policy
 from app.engine import (
     LocalAIClient,
     LocalScheduler,
@@ -28,6 +29,9 @@ from app.engine import (
     validate_workflow,
     resolve_observed_element,
     verify_workflow_signature,
+    save_prompt_template,
+    load_prompt_template,
+    render_prompt_template,
     write_error_report,
 )
 
@@ -104,6 +108,60 @@ def test_offline_application_adapters():
         normalize_excel_cell_reference("XFE1")
     with pytest.raises(ValueError):
         validate_pdf_page_number(0)
+
+
+def test_approved_local_document_search_is_bounded(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    (approved / "report.txt").write_text("2026년 예산 보고서 합계 100", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("예산 보고서 외부 파일", encoding="utf-8")
+    assert normalize_document_roots([str(approved), str(outside)]) == [approved.resolve()]
+    link = tmp_path / "approved-link"
+    link.symlink_to(approved, target_is_directory=True)
+    assert normalize_document_roots([str(link)]) == []
+    (approved / "contact.txt").write_text("예산 담당자 010-1234-5678 test@example.com", encoding="utf-8")
+    results = search_approved_documents([str(approved)], "담당자")
+    assert len(results) == 1
+    assert results[0]["relative_path"] == "contact.txt"
+    assert "010-1234-5678" not in results[0]["snippet"]
+    assert "<전화번호 마스킹>" in results[0]["snippet"]
+    context = build_document_context([str(approved)], "담당자")
+    assert context["result_count"] == 1
+    assert str(approved.resolve()) in context["approved_roots"]
+
+
+def test_policy_profiles_block_unsafe_actions():
+    valid, message = validate_plan_policy({"steps": [{"action": "type", "risk": "write", "requires_confirmation": True}]}, "public_document")
+    assert valid is False
+    assert "허용하지 않습니다" in message
+    valid, message = validate_plan_policy({"steps": [{"action": "click", "risk": "read", "requires_confirmation": True}]}, "browser")
+    assert valid is True
+
+
+def test_validate_ai_steps_applies_policy_profile():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [{"id": "uia_edit", "role": "edit", "name": "문서", "control_type": "Edit", "bbox": [10, 20, 110, 60], "source": "uia"}],
+    }
+    valid, message = validate_ai_steps(
+        {"steps": [{"action": "type", "element_id": "uia_edit", "text": "확인", "confidence": 0.95, "risk": "write", "requires_confirmation": True}]},
+        (1920, 1080),
+        observation,
+        "public_document",
+    )
+    assert valid is False
+    assert "안전 프로필" in message
+
+
+def test_prompt_template_roundtrip_and_fail_closed(tmp_path: Path):
+    path = tmp_path / "prompt.json"
+    save_prompt_template(path, "월간 보고서", "{{month}} 보고서를 {{target}}에서 확인해 줘", "public_document", [str(tmp_path)])
+    data = load_prompt_template(path)
+    assert data["placeholders"] == ["month", "target"]
+    assert render_prompt_template(data["goal_template"], {"month": "3월", "target": "문서함"}) == "3월 보고서를 문서함에서 확인해 줘"
+    with pytest.raises(ValueError):
+        render_prompt_template(data["goal_template"], {"month": "3월"})
 
 
 def test_ai_plan_validation():

@@ -1212,6 +1212,12 @@ class LocalAIClient:
             return {"summary": str(data), "risk": "high", "steps": []}
         return data
 
+    def make_recovery_plan(self, failure_context: Dict[str, Any], observation: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a conservative recovery proposal; never execute it automatically."""
+        enriched = dict(observation)
+        enriched["recovery_context"] = redact_sensitive(failure_context)
+        return self.make_plan("실패 원인을 분석하고, 위험 동작 없이 사용자가 검토할 복구 계획을 제안해 줘", enriched)
+
     def make_plan(self, goal: str, observation: Dict[str, Any]) -> Dict[str, Any]:
         import requests
 
@@ -1220,8 +1226,14 @@ class LocalAIClient:
             raise ValueError("업무 목표를 입력하세요.")
         if len(goal) > 4000:
             raise ValueError("업무 목표는 최대 4,000자까지 입력할 수 있습니다.")
+        try:
+            from policies import profile_prompt_rules
+        except ImportError:
+            from app.policies import profile_prompt_rules
+        policy_profile = str(observation.get("policy_profile", "standard"))
         system = (
             "당신은 Windows 데스크톱 업무 자동화의 계획기입니다. "
+            + profile_prompt_rules(policy_profile) + " "
             "반드시 관찰 JSON의 elements에 실제로 존재하는 element_id를 우선 사용하십시오. "
             "각 UI 동작에는 가능하면 element_role, element_name, element_control_type도 함께 복사하십시오. "
             "실행 직전 화면이 갱신될 수 있으므로 element_id가 바뀌더라도 세 의미 단서로 하나의 요소만 특정될 때만 안전하게 재바인딩합니다. "
@@ -1229,6 +1241,7 @@ class LocalAIClient:
             "허용 action은 click, double_click, type, hotkey, scroll, wait, none뿐입니다. "
             "파일 삭제, 명령 셸, 결제, 전송, 게시, 로그인 정보 입력, 결재는 계획하지 마십시오. "
             "제출·삭제·저장 덮어쓰기·권한 변경처럼 위험한 동작은 requires_confirmation=true로 설정하십시오. "
+            "복구 계획 요청에서는 원인 분석과 재관찰·대기·읽기 동작을 우선하고, 파일 삭제·전송·게시·민감정보 입력은 절대 제안하지 마십시오. "
             "반드시 JSON Schema에 맞는 계획 하나만 반환하십시오."
         )
         user_text = {
@@ -1237,6 +1250,9 @@ class LocalAIClient:
             "screen_size": observation.get("screen_size", []),
             "ocr_text": observation.get("ocr_text", ""),
             "application_context": observation.get("application_context", {}),
+            "policy_profile": policy_profile,
+            "document_context": observation.get("document_context", {}),
+            "recovery_context": observation.get("recovery_context", {}),
             "elements": observation.get("elements", [])[:120],
             "frame_hash": observation.get("frame_hash", ""),
         }
@@ -1296,6 +1312,64 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
             temporary.unlink()
 
 
+PROMPT_TEMPLATE_VERSION = 1
+MAX_PROMPT_TEMPLATE_LENGTH = 4_000
+
+
+def save_prompt_template(path: Path, name: str, goal_template: str, policy_profile: str = "standard", document_roots: list[str] | None = None) -> None:
+    """Persist a parameterized natural-language task template locally and atomically."""
+    title = (name or "자연어 작업 템플릿").strip()[:200]
+    template = (goal_template or "").strip()
+    if not template or len(template) > MAX_PROMPT_TEMPLATE_LENGTH:
+        raise ValueError(f"자연어 템플릿은 1~{MAX_PROMPT_TEMPLATE_LENGTH:,}자여야 합니다.")
+    placeholders = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", template)))[:30]
+    payload = {"version": PROMPT_TEMPLATE_VERSION, "name": title, "goal_template": template, "placeholders": placeholders, "policy_profile": policy_profile or "standard", "document_roots": [str(item)[:500] for item in (document_roots or [])[:5]]}
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_prompt_template(path: Path) -> Dict[str, Any]:
+    """Load and validate a natural-language task template."""
+    target = Path(path)
+    if target.stat().st_size > 256 * 1024:
+        raise ValueError("자연어 템플릿 파일이 너무 큽니다.")
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"자연어 템플릿을 읽을 수 없습니다: {exc}") from exc
+    if not isinstance(data, dict) or data.get("version") != PROMPT_TEMPLATE_VERSION:
+        raise ValueError("지원하지 않는 자연어 템플릿 버전입니다.")
+    template = str(data.get("goal_template", "")).strip()
+    if not template or len(template) > MAX_PROMPT_TEMPLATE_LENGTH:
+        raise ValueError("자연어 템플릿 내용이 올바르지 않습니다.")
+    data["goal_template"] = template
+    data["placeholders"] = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", template)))[:30]
+    data["policy_profile"] = str(data.get("policy_profile", "standard"))[:80]
+    roots = data.get("document_roots", [])
+    data["document_roots"] = [str(item)[:500] for item in roots[:5]] if isinstance(roots, list) else []
+    return data
+
+
+def render_prompt_template(template: str, values: Dict[str, Any]) -> str:
+    """Render explicit double-brace variables and fail closed on missing values."""
+    text = str(template or "")
+    names = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", text)))
+    for name in names:
+        if name not in values or not str(values[name]).strip():
+            raise ValueError(f"템플릿 변수 {name} 값이 없습니다.")
+        text = re.sub(r"\{\{\s*" + re.escape(name) + r"\s*\}\}", str(values[name]).strip(), text)
+    if len(text) > MAX_PROMPT_TEMPLATE_LENGTH:
+        raise ValueError("렌더링된 자연어 템플릿이 너무 깁니다.")
+    return text
+
+
 def load_workflow(path: Path, require_signature: bool = False) -> Workflow:
     path = Path(path)
     if path.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
@@ -1317,12 +1391,20 @@ def validate_ai_steps(
     plan: Dict[str, Any],
     screen_size: tuple[int, int] | None = None,
     observation: Dict[str, Any] | None = None,
+    policy_profile: str = "standard",
 ) -> tuple[bool, str]:
     """Validate a plan against the current screen elements; direct coordinates are rejected."""
     try:
         parsed = AutomationPlan.model_validate(plan)
     except ValidationError as exc:
         return False, f"구조화 계획 형식 오류: {exc.errors()[0].get('msg', str(exc))}"
+    try:
+        from policies import validate_plan_policy
+    except ImportError:
+        from app.policies import validate_plan_policy
+    policy_valid, policy_reason = validate_plan_policy(plan, policy_profile)
+    if not policy_valid:
+        return False, policy_reason
     if observation is None:
         return False, "현재 화면의 element_id 정보가 없어 실행할 수 없습니다. 화면을 다시 관찰하세요."
     try:

@@ -46,7 +46,18 @@ from engine import (
     validate_local_endpoint,
     validate_timeout,
     validate_schedule_interval,
+    save_prompt_template,
+    load_prompt_template,
+    render_prompt_template,
 )
+try:
+    from adapters import build_document_context, normalize_document_roots
+except ImportError:
+    from app.adapters import build_document_context, normalize_document_roots
+try:
+    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile
+except ImportError:
+    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile
 
 try:
     import pyautogui
@@ -218,7 +229,11 @@ class AutoWorkAgent(tk.Tk):
         ttk.Label(goal_frame, text="예: 현재 문서에서 표의 합계를 계산하고 결과를 지정된 셀에 입력해 줘").pack(anchor="w")
         self.goal_text = tk.Text(goal_frame, height=3, wrap="word", font=("Segoe UI", 10))
         self.goal_text.pack(fill="x", pady=(7, 0))
-        ttk.Button(goal_frame, text="화면 관찰 후 계획 생성", command=self._make_ai_plan, style="Primary.TButton").pack(anchor="e", pady=(8, 0))
+        goal_actions = ttk.Frame(goal_frame)
+        goal_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(goal_actions, text="자연어 템플릿 불러오기", command=self._load_prompt_template).pack(side="left")
+        ttk.Button(goal_actions, text="자연어 템플릿 저장", command=self._save_prompt_template).pack(side="left", padx=6)
+        ttk.Button(goal_actions, text="화면 관찰 후 계획 생성", command=self._make_ai_plan, style="Primary.TButton").pack(side="right")
 
         body = ttk.Panedwindow(self.ai_tab, orient="horizontal")
         body.pack(fill="both", expand=True)
@@ -263,14 +278,24 @@ class AutoWorkAgent(tk.Tk):
         self.dry_run_enabled = bool(self._config_data.get("dry_run", True))
         self.dry_run_var = tk.BooleanVar(value=self.dry_run_enabled)
         ttk.Checkbutton(card, text="AI 계획은 실제 입력 없이 검증만 수행(dry-run)", variable=self.dry_run_var, command=self._sync_safety_settings).grid(row=4, column=1, sticky="w", pady=6)
-        ttk.Button(card, text="설정 저장", command=self._save_config).grid(row=5, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(card, text="예약 실행 간격(초)", width=22).grid(row=6, column=0, sticky="w", pady=(18, 6))
+        ttk.Label(card, text="업무별 안전 프로필", width=22).grid(row=5, column=0, sticky="w", pady=6)
+        profile_values = list(POLICY_PROFILES.keys())
+        saved_profile = str(self._config_data.get("policy_profile", DEFAULT_POLICY_PROFILE))
+        if saved_profile not in profile_values:
+            saved_profile = DEFAULT_POLICY_PROFILE
+        self.policy_profile_var = tk.StringVar(value=saved_profile)
+        ttk.Combobox(card, textvariable=self.policy_profile_var, values=profile_values, state="readonly", width=30).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Label(card, text="승인 문서 루트(;로 구분)", width=22).grid(row=6, column=0, sticky="w", pady=6)
+        self.document_roots_var = tk.StringVar(value=";".join(str(item) for item in self._config_data.get("document_roots", []) if isinstance(item, str)))
+        ttk.Entry(card, textvariable=self.document_roots_var, width=58).grid(row=6, column=1, sticky="w", pady=6)
+        ttk.Button(card, text="설정 저장", command=self._save_config).grid(row=7, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(card, text="예약 실행 간격(초)", width=22).grid(row=8, column=0, sticky="w", pady=(18, 6))
         self.schedule_interval_var = tk.StringVar(value=str(self._config_data.get("schedule_interval", 3600)))
-        ttk.Entry(card, textvariable=self.schedule_interval_var, width=18).grid(row=6, column=1, sticky="w", pady=(18, 6))
+        ttk.Entry(card, textvariable=self.schedule_interval_var, width=18).grid(row=8, column=1, sticky="w", pady=(18, 6))
         self.schedule_status_var = tk.StringVar(value="예약 실행 중지")
-        ttk.Label(card, textvariable=self.schedule_status_var, style="Sub.TLabel").grid(row=7, column=1, sticky="w")
+        ttk.Label(card, textvariable=self.schedule_status_var, style="Sub.TLabel").grid(row=9, column=1, sticky="w")
         schedule_buttons = ttk.Frame(card)
-        schedule_buttons.grid(row=8, column=1, sticky="w", pady=(4, 0))
+        schedule_buttons.grid(row=10, column=1, sticky="w", pady=(4, 0))
         ttk.Button(schedule_buttons, text="예약 시작", command=self._start_scheduler).pack(side="left")
         ttk.Button(schedule_buttons, text="예약 중지", command=self._stop_scheduler).pack(side="left", padx=6)
         ttk.Label(
@@ -392,8 +417,53 @@ class AutoWorkAgent(tk.Tk):
         self.last_failed_step_index = max(0, index - 1)
         if hasattr(self, "resume_play_button"):
             self.after(0, lambda: self.resume_play_button.configure(state="normal"))
-        report_path = self._handle_exception("작업 재생", exc, {"failed_step": index, "step": redact_sensitive(step.__dict__)})
+        failure_context = {"failed_step": index, "step": redact_sensitive(step.__dict__), "error_type": type(exc).__name__, "error": str(exc)[:1200]}
+        report_path = self._handle_exception("작업 재생", exc, failure_context)
         self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
+        self.after(0, lambda: self._offer_recovery_plan(failure_context))
+
+    def _offer_recovery_plan(self, failure_context: Dict[str, Any]) -> None:
+        if not messagebox.askyesno("AI 복구 분석", "실패한 화면을 다시 관찰해 복구 계획을 제안할까요?\n\n복구안은 자동 실행되지 않으며 사용자가 검토해야 합니다."):
+            return
+        if self.ai_running or not self._ai_job_lock.acquire(blocking=False):
+            messagebox.showwarning("AI 실행 중", "다른 AI 작업이 진행 중입니다.")
+            return
+        settings = {
+            "endpoint": self.endpoint_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "timeout": self.timeout_var.get().strip(),
+            "vision": bool(self.vision_var.get()),
+            "policy_profile": self._current_policy_profile(),
+            "document_roots": [str(path) for path in normalize_document_roots(self.document_roots_var.get())],
+        }
+        self.ai_running = True
+        self._set_status("실패 원인 분석 및 복구 계획 생성 중…")
+        threading.Thread(target=self._recovery_worker, args=(failure_context, settings), daemon=True, name="recovery-planner").start()
+
+    def _recovery_worker(self, failure_context: Dict[str, Any], settings: Dict[str, Any]) -> None:
+        try:
+            observation = capture_observation()
+            observation["policy_profile"] = str(settings.get("policy_profile", DEFAULT_POLICY_PROFILE))
+            observation["document_context"] = build_document_context(settings.get("document_roots", []), "복구에 필요한 현재 문서 상태")
+            settings = {
+                **settings,
+                "endpoint": validate_local_endpoint(str(settings["endpoint"])),
+                "model": str(settings["model"]),
+                "timeout": validate_timeout(settings["timeout"]),
+                "vision": bool(settings["vision"]),
+            }
+            if not settings["model"]:
+                raise ValueError("모델 이름을 입력하세요.")
+            client = LocalAIClient(settings["endpoint"], settings["model"], settings["timeout"], settings["vision"])
+            plan = client.make_recovery_plan(failure_context, observation)
+            self.after(0, lambda: self._show_ai_result(observation, plan))
+            self.after(0, lambda: self._set_status("복구 계획 생성 완료 · 검토 후 실행 가능"))
+        except Exception as exc:
+            report_path = self._handle_exception("복구 계획 생성", exc, {"failure": failure_context})
+            self.after(0, lambda: self._show_exception_dialog("복구 계획 생성", exc, report_path))
+        finally:
+            self.ai_running = False
+            self._ai_job_lock.release()
 
     def report_callback_exception(self, exc: type[BaseException], value: BaseException, tb: Any) -> None:
         report_path = self._handle_exception("GUI 이벤트", value, {"traceback": "".join(traceback.format_exception(exc, value, tb))[-12000:]})
@@ -417,6 +487,10 @@ class AutoWorkAgent(tk.Tk):
         if hasattr(self, "stop_ai_button"):
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
         self._set_status("긴급 중지 요청 · 재생 및 AI 실행 중단")
+
+    def _current_policy_profile(self) -> str:
+        selected = self.policy_profile_var.get().strip() if hasattr(self, "policy_profile_var") else DEFAULT_POLICY_PROFILE
+        return selected if selected in POLICY_PROFILES else DEFAULT_POLICY_PROFILE
 
     def _sync_safety_settings(self) -> None:
         self.dry_run_enabled = bool(self.dry_run_var.get()) if hasattr(self, "dry_run_var") else self.dry_run_enabled
@@ -811,6 +885,55 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             messagebox.showerror("불러오기 실패", str(exc))
 
+    def _save_prompt_template(self) -> None:
+        goal_template = self.goal_text.get("1.0", "end").strip()
+        if not goal_template:
+            messagebox.showinfo("템플릿 내용 필요", "저장할 자연어 업무 목표를 입력하세요.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="자연어 템플릿 저장",
+            initialdir=str(TEMPLATE_DIR),
+            initialfile="prompt_template.json",
+            defaultextension=".json",
+            filetypes=[("자연어 템플릿", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            save_prompt_template(Path(path), Path(path).stem, goal_template, self._current_policy_profile(), [str(item) for item in normalize_document_roots(self.document_roots_var.get())])
+            self._set_status(f"자연어 템플릿 저장 완료 · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("자연어 템플릿 저장 실패", str(exc))
+
+    def _load_prompt_template(self) -> None:
+        path = filedialog.askopenfilename(
+            title="자연어 템플릿 불러오기",
+            initialdir=str(TEMPLATE_DIR),
+            filetypes=[("자연어 템플릿", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = load_prompt_template(Path(path))
+            values: Dict[str, Any] = {}
+            for placeholder in data.get("placeholders", []):
+                value = simpledialog.askstring("템플릿 변수", f"{placeholder} 값을 입력하세요.", parent=self)
+                if value is None:
+                    return
+                values[placeholder] = value
+            goal = render_prompt_template(data["goal_template"], values)
+            self.goal_text.delete("1.0", "end")
+            self.goal_text.insert("1.0", goal)
+            profile = str(data.get("policy_profile", DEFAULT_POLICY_PROFILE))
+            if profile in POLICY_PROFILES:
+                self.policy_profile_var.set(profile)
+            roots = data.get("document_roots", [])
+            if isinstance(roots, list):
+                self.document_roots_var.set(";".join(str(item) for item in roots))
+            self._set_status(f"자연어 템플릿 불러오기 완료 · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("자연어 템플릿 불러오기 실패", str(exc))
+
     def _make_ai_plan(self) -> None:
         if self.ai_running:
             messagebox.showwarning("AI 실행 중", "현재 AI 계획을 먼저 중지하거나 완료하세요.")
@@ -825,6 +948,8 @@ class AutoWorkAgent(tk.Tk):
                 "model": self.model_var.get().strip(),
                 "timeout": validate_timeout(self.timeout_var.get().strip()),
                 "vision": bool(self.vision_var.get()),
+                "policy_profile": self._current_policy_profile(),
+                "document_roots": [str(path) for path in normalize_document_roots(self.document_roots_var.get())],
             }
             if not settings["model"]:
                 raise ValueError("모델 이름을 입력하세요.")
@@ -842,6 +967,8 @@ class AutoWorkAgent(tk.Tk):
     def _agent_worker(self, goal: str, settings: Dict[str, Any]) -> None:
         try:
             observation = capture_observation()
+            observation["policy_profile"] = str(settings.get("policy_profile", DEFAULT_POLICY_PROFILE))
+            observation["document_context"] = build_document_context(settings.get("document_roots", []), goal)
             client = LocalAIClient(
                 endpoint=str(settings["endpoint"]),
                 model=str(settings["model"]),
@@ -851,7 +978,7 @@ class AutoWorkAgent(tk.Tk):
             plan = client.make_plan(goal, observation)
             self.after(0, lambda: self._show_ai_result(observation, plan))
         except Exception as exc:
-            report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal)})
+            report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal), "policy_profile": settings.get("policy_profile", DEFAULT_POLICY_PROFILE)})
             self.after(0, lambda: self._agent_failed(exc, report_path))
         finally:
             self.ai_running = False
@@ -881,6 +1008,8 @@ class AutoWorkAgent(tk.Tk):
         obs_display = {
             "현재 창": observation.get("active_window", ""),
             "애플리케이션 맥락": observation.get("application_context", {}),
+            "안전 프로필": observation.get("policy_profile", DEFAULT_POLICY_PROFILE),
+            "문서 검색 맥락": observation.get("document_context", {}),
             "화면 크기": observation.get("screen_size", []),
             "캡처 시각": observation.get("captured_at", ""),
             "OCR": observation.get("ocr_text", ""),
@@ -893,7 +1022,7 @@ class AutoWorkAgent(tk.Tk):
         }
         self._set_text(self.observation_text, self._pretty_json(obs_display))
         self._set_text(self.plan_text, self._pretty_json(plan))
-        valid, reason = validate_ai_steps(plan, tuple(observation.get("screen_size", [100000, 100000])), observation)
+        valid, reason = validate_ai_steps(plan, tuple(observation.get("screen_size", [100000, 100000])), observation, self._current_policy_profile())
         if valid and plan.get("steps"):
             self.execute_plan_button.configure(state="normal")
             self._set_status(f"AI 계획 준비 완료 · 위험도 {plan.get('risk', 'unknown')}")
@@ -911,6 +1040,7 @@ class AutoWorkAgent(tk.Tk):
             self.last_plan,
             tuple(self.last_observation.get("screen_size", [100000, 100000])) if self.last_observation else None,
             self.last_observation,
+            self._current_policy_profile(),
         )
         if not valid:
             self._ai_job_lock.release()
@@ -1037,6 +1167,7 @@ class AutoWorkAgent(tk.Tk):
                         {"summary": "single step", "risk": plan_risk, "steps": [step]},
                         tuple(observation.get("screen_size", [100000, 100000])),
                         observation,
+                        self._current_policy_profile(),
                     )
                     if not valid:
                         raise RetryableAutomationError(reason)
@@ -1073,7 +1204,7 @@ class AutoWorkAgent(tk.Tk):
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
 
     def _load_config(self) -> None:
-        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": "120", "vision": False, "capture_on_error": True, "schedule_interval": 3600}
+        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": "120", "vision": False, "capture_on_error": True, "schedule_interval": 3600, "policy_profile": DEFAULT_POLICY_PROFILE, "document_roots": []}
         data: Dict[str, Any] = {}
         try:
             if CONFIG_PATH.exists():
@@ -1099,6 +1230,8 @@ class AutoWorkAgent(tk.Tk):
                 "capture_on_error": bool(self.capture_on_error_var.get()),
                 "dry_run": bool(self.dry_run_var.get()),
                 "schedule_interval": validate_schedule_interval(self.schedule_interval_var.get().strip()),
+                "policy_profile": self._current_policy_profile(),
+                "document_roots": [str(path) for path in normalize_document_roots(self.document_roots_var.get())],
             }
             temp_path = CONFIG_PATH.with_suffix(".tmp")
             temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
