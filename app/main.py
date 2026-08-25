@@ -31,7 +31,10 @@ from engine import (
     append_execution_history,
     read_execution_history,
     capture_observation,
+    cleanup_expired_artifacts,
     ensure_app_dirs,
+    redact_sensitive,
+    validate_workflow,
     write_error_report,
     load_workflow,
     save_workflow,
@@ -60,6 +63,7 @@ class AutoWorkAgent(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         ensure_app_dirs()
+        cleanup_expired_artifacts()
         self.title("AutoWork Agent · 로컬 데스크톱 자동화")
         self.geometry("1060x760")
         self.minsize(900, 620)
@@ -73,6 +77,8 @@ class AutoWorkAgent(tk.Tk):
         self.hotkey_listener = None
         self.ai_stop_event = threading.Event()
         self.ai_running = False
+        self._ai_job_lock = threading.Lock()
+        self._playback_launch_lock = threading.Lock()
         self.last_ai_index = 0
         self.dry_run_enabled = True
         self.capture_on_error_enabled = True
@@ -607,7 +613,16 @@ class AutoWorkAgent(tk.Tk):
         if self.recording:
             messagebox.showwarning("기록 중", "기록을 먼저 중지하세요.")
             return
+        if self.player.running or not self._playback_launch_lock.acquire(blocking=False):
+            messagebox.showwarning("재생 중", "이미 다른 작업을 재생 중입니다.")
+            return
+        valid, reason = validate_workflow(self.workflow, get_screen_size())
+        if not valid:
+            self._playback_launch_lock.release()
+            messagebox.showerror("재생할 수 없는 작업", reason)
+            return
         if not self.workflow.steps:
+            self._playback_launch_lock.release()
             messagebox.showinfo("재생할 작업 없음", "먼저 작업을 기록하거나 파일을 불러오세요.")
             return
         recorded_size = self.workflow.recorded_screen_size
@@ -625,22 +640,25 @@ class AutoWorkAgent(tk.Tk):
             "저장된 모든 마우스·키보드 동작을 현재 화면에서 실행합니다.\n\n"            "민감한 정보 입력이나 문서 전송이 포함되어 있지 않은지 확인했습니까?",
         )
         if not ok:
+            self._playback_launch_lock.release()
             return
         self.pause_play_button.configure(state="normal", text="재생 일시정지")
-        threading.Thread(target=self._play_workflow_worker, daemon=True).start()
+        threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True).start()
 
-    def _play_workflow_worker(self) -> None:
-        recorded_size = self.workflow.recorded_screen_size
+    def _play_workflow_worker(self, workflow: Workflow) -> None:
+        recorded_size = workflow.recorded_screen_size
         size_text = f"{recorded_size[0]}x{recorded_size[1]}" if recorded_size else ""
-        append_execution_history("playback_started", self.workflow, screen_size=size_text)
+        append_execution_history("playback_started", workflow, screen_size=size_text)
         try:
-            self.player.play(self.workflow)
+            self.player.play(workflow)
             event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
-            append_execution_history(event, self.workflow, last_step=self.player.current_index)
+            append_execution_history(event, workflow, last_step=self.player.current_index)
         except Exception as exc:
-            append_execution_history("playback_failed", self.workflow, last_step=self.player.current_index, error=type(exc).__name__)
-            raise
+            append_execution_history("playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__)
+            report_path = self._handle_exception("작업 재생", exc)
+            self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
         finally:
+            self._playback_launch_lock.release()
             self.after(0, lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
             self.after(0, self._refresh_history_view)
 
@@ -698,6 +716,10 @@ class AutoWorkAgent(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("설정값 오류", str(exc))
             return
+        if not self._ai_job_lock.acquire(blocking=False):
+            messagebox.showwarning("AI 실행 중", "현재 AI 계획 작업이 이미 진행 중입니다.")
+            return
+        self.ai_running = True
         self.execute_plan_button.configure(state="disabled")
         self._set_status("화면 관찰 및 로컬 AI 계획 생성 중…")
         threading.Thread(target=self._agent_worker, args=(goal, settings), daemon=True).start()
@@ -716,6 +738,9 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal)})
             self.after(0, lambda: self._agent_failed(exc, report_path))
+        finally:
+            self.ai_running = False
+            self._ai_job_lock.release()
 
     def _agent_failed(self, error: BaseException, report_path: Optional[Path]) -> None:
         self._set_status("AI 계획 생성 실패")
@@ -764,12 +789,16 @@ class AutoWorkAgent(tk.Tk):
     def _execute_ai_plan(self) -> None:
         if not self.last_plan:
             return
+        if self.ai_running or not self._ai_job_lock.acquire(blocking=False):
+            messagebox.showwarning("AI 실행 중", "다른 AI 작업이 진행 중입니다.")
+            return
         valid, reason = validate_ai_steps(
             self.last_plan,
             tuple(self.last_observation.get("screen_size", [100000, 100000])) if self.last_observation else None,
             self.last_observation,
         )
         if not valid:
+            self._ai_job_lock.release()
             messagebox.showerror("실행할 수 없는 계획", reason)
             return
         steps = self.last_plan.get("steps", [])
@@ -777,6 +806,7 @@ class AutoWorkAgent(tk.Tk):
         risk = self.last_plan.get("risk", "unknown")
         preview = "\n".join(f"{i}. {s.get('action')} · {s.get('reason', '')}" for i, s in enumerate(steps, 1))
         if not messagebox.askyesno("AI 계획 실행 최종 확인", f"요약: {summary}\n위험도: {risk}\n\n{preview}\n\n실행하시겠습니까?"):
+            self._ai_job_lock.release()
             return
         append_execution_history(
             "ai_plan_approved",
@@ -835,7 +865,7 @@ class AutoWorkAgent(tk.Tk):
         if action == "none":
             raise RetryableAutomationError("AI가 실행할 수 있는 동작을 결정하지 못했습니다.")
         if self.dry_run_enabled:
-            append_log(f"DRY_RUN 단계 검증: {step}")
+            append_log(f"DRY_RUN 단계 검증: {redact_sensitive(step)}")
             return
         if pyautogui is None:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
@@ -906,6 +936,8 @@ class AutoWorkAgent(tk.Tk):
                         last_error = exc
                         if attempt >= 3:
                             raise
+                        if step.get("action") in {"type", "hotkey"} or step.get("risk") in {"write", "submit", "delete", "unknown"}:
+                            raise UserInterventionRequired("쓰기·제출·삭제 가능 동작은 자동 재시도하지 않습니다.") from exc
                         time.sleep(min(0.6 * (2 ** (attempt - 1)), 4.0))
                 if last_error is not None:
                     raise last_error
@@ -920,6 +952,7 @@ class AutoWorkAgent(tk.Tk):
         finally:
             append_execution_history(outcome, self.workflow, last_step=self.last_ai_index, dry_run=bool(self.dry_run_enabled))
             self.ai_running = False
+            self._ai_job_lock.release()
             self.after(0, lambda: self.execute_plan_button.configure(state="normal"))
             self.after(0, self._refresh_history_view)
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
@@ -951,7 +984,9 @@ class AutoWorkAgent(tk.Tk):
                 "capture_on_error": bool(self.capture_on_error_var.get()),
                 "dry_run": bool(self.dry_run_var.get()),
             }
-            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp_path = CONFIG_PATH.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp_path.replace(CONFIG_PATH)
             self._set_status("로컬 AI 설정 저장 완료")
         except Exception as exc:
             messagebox.showerror("설정 저장 실패", str(exc))

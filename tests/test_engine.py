@@ -17,6 +17,7 @@ from app.engine import (
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
+    validate_workflow,
     write_error_report,
 )
 
@@ -112,6 +113,43 @@ def test_ai_plan_rejects_direct_coordinates():
     valid, message = validate_ai_steps({"steps": [{"action": "click", "x": 10, "y": 20}]}, (1920, 1080), {"elements": []})
     assert valid is False
     assert "구조화 계획 형식 오류" in message or "element_id" in message
+
+
+def test_workflow_rejects_out_of_bounds_click():
+    valid, message = validate_workflow(Workflow(steps=[Step(type="click", x=-1, y=10, button="left")]), (1920, 1080))
+    assert valid is False
+    assert "화면 밖" in message
+
+
+def test_ai_plan_rejects_unconfirmed_text_input():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [{"id": "uia_edit", "role": "edit", "name": "메모", "control_type": "Edit", "bbox": [10, 20, 110, 60], "source": "uia", "enabled": True, "visible": True}],
+    }
+    valid, message = validate_ai_steps(
+        {"steps": [{"action": "type", "element_id": "uia_edit", "text": "업무자료", "confidence": 0.95, "risk": "read", "requires_confirmation": False}]},
+        (1920, 1080),
+        observation,
+    )
+    assert valid is False
+    assert "확인" in message
+
+
+def test_error_report_redacts_sensitive_context(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "WORKFLOW_DIR", tmp_path / "app" / "workflows")
+    monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "app" / "cache")
+    monkeypatch.setattr(engine, "ERROR_DIR", tmp_path / "app" / "errors")
+    monkeypatch.setattr(engine, "DEBUG_DIR", tmp_path / "app" / "debug_snapshots")
+    monkeypatch.setattr(engine, "LOG_PATH", tmp_path / "app" / "autowork.log")
+    try:
+        raise RuntimeError("test failure")
+    except RuntimeError as exc:
+        report_path = write_error_report({"component": "test", "step": {"text": "비밀번호123"}}, exc, capture_screen=False)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    serialized = json.dumps(report, ensure_ascii=False)
+    assert "비밀번호123" not in serialized
+    assert "redacted" in serialized
 
 
 def test_ai_plan_rejects_unknown_element():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -46,14 +47,32 @@ WORKFLOW_VERSION = 2
 MAX_WORKFLOW_FILE_BYTES = 10 * 1024 * 1024
 MAX_WORKFLOW_STEPS = 10_000
 MAX_TEXT_INPUT_LENGTH = 100_000
+MAX_STEP_DELAY = 60.0
+MAX_CAPTURE_AGE_DAYS = 30
+SENSITIVE_FIELD_NAMES = {"text", "value", "password", "token", "secret", "authorization", "api_key"}
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
+
+
+def redact_sensitive(value: Any) -> Any:
+    """Redact values that may contain typed text or credentials in diagnostics."""
+    if isinstance(value, dict):
+        return {
+            key: (f"<redacted:{len(str(item))} chars>" if str(key).lower() in SENSITIVE_FIELD_NAMES else redact_sensitive(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive(item) for item in value)
+    return value
 
 
 def append_log(message: str, level: str = "INFO") -> None:
     """Append a local diagnostic line without sending data anywhere."""
     ensure_app_dirs()
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {message}\n"
+    safe_message = str(redact_sensitive(message))
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {safe_message}\n"
     with _LOG_LOCK:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -108,7 +127,7 @@ def write_error_report(context: Dict[str, Any], exc: BaseException, capture_scre
     report_path = ERROR_DIR / f"error_{stamp}.json"
     report: Dict[str, Any] = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "context": context,
+        "context": redact_sensitive(context),
         "error_type": type(exc).__name__,
         "error": str(exc)[:4000],
         "traceback": (traceback_text or traceback.format_exc())[-16000:],
@@ -262,14 +281,22 @@ class Workflow:
         steps: List[Step] = []
         allowed_types = {"click", "key", "wait"}
         allowed_buttons = {"left", "right", "middle", "x1", "x2"}
+        allowed_fields = set(Step.__dataclass_fields__)
         for index, raw in enumerate(raw_steps, start=1):
             if not isinstance(raw, dict) or raw.get("type") not in allowed_types:
                 raise ValueError(f"{index}번째 단계의 동작 유형이 올바르지 않습니다.")
+            unknown = set(raw) - allowed_fields
+            if unknown:
+                raise ValueError(f"{index}번째 단계에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
             try:
-                step = Step(**{key: raw.get(key) for key in Step.__dataclass_fields__})
+                step = Step(**{key: raw[key] for key in raw})
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{index}번째 단계의 형식이 올바르지 않습니다.") from exc
-            if not 0 <= float(step.delay) <= 60:
+            try:
+                delay = float(step.delay)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{index}번째 단계의 대기 시간이 올바르지 않습니다.") from exc
+            if not math.isfinite(delay) or not 0 <= delay <= MAX_STEP_DELAY:
                 raise ValueError(f"{index}번째 단계의 대기 시간은 0~60초여야 합니다.")
             if step.type == "click":
                 if step.x is None or step.y is None or not (-100_000 <= int(step.x) <= 100_000) or not (-100_000 <= int(step.y) <= 100_000):
@@ -279,6 +306,10 @@ class Workflow:
             elif step.type == "key":
                 if step.event not in {"down", "up"} or step.kind not in {"char", "special"} or not step.value or len(step.value) > 32:
                     raise ValueError(f"{index}번째 키 입력 형식이 올바르지 않습니다.")
+                if step.kind == "special":
+                    allowed_specials = set(WorkflowPlayer.KEY_ALIASES) | {f"f{i}" for i in range(1, 13)}
+                    if step.value not in allowed_specials:
+                        raise ValueError(f"{index}번째 특수 키 이름이 허용되지 않습니다.")
             elif step.type == "wait":
                 try:
                     if not 0 <= float(step.value or 0) <= 60:
@@ -503,6 +534,7 @@ class WorkflowPlayer:
         self.current_index = 0
         self.current_step: Optional[Step] = None
         self._pressed_keys: set[str] = set()
+        self._run_lock = threading.Lock()
 
     @property
     def paused(self) -> bool:
@@ -653,6 +685,12 @@ class WorkflowPlayer:
     def play(self, workflow: Workflow) -> None:
         if pyautogui is None:
             raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
+        current_screen = get_screen_size()
+        valid, reason = validate_workflow(workflow, current_screen)
+        if not valid:
+            raise ValueError(reason)
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("이미 다른 작업을 재생 중입니다.")
         self.stop_event.clear()
         self.pause_event.clear()
         self.running = True
@@ -688,6 +726,74 @@ class WorkflowPlayer:
             self.running = False
             if self.on_status:
                 self.on_status("재생 종료")
+            self._run_lock.release()
+
+
+def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> tuple[bool, str]:
+    """Validate persisted or recorded workflows before OS-level input is sent."""
+    if not isinstance(workflow, Workflow):
+        return False, "유효하지 않은 작업 객체입니다."
+    if len(workflow.steps) > MAX_WORKFLOW_STEPS:
+        return False, f"작업 단계는 {MAX_WORKFLOW_STEPS:,}개를 초과할 수 없습니다."
+    width, height = 100000, 100000
+    if screen_size is not None:
+        try:
+            width, height = int(screen_size[0]), int(screen_size[1])
+        except (TypeError, ValueError, IndexError):
+            return False, "화면 크기 형식이 유효하지 않습니다."
+        if width <= 0 or height <= 0:
+            return False, "화면 크기는 양수여야 합니다."
+    for index, step in enumerate(workflow.steps, start=1):
+        if step.type not in {"click", "key", "wait"}:
+            return False, f"{index}번째 단계의 동작이 허용되지 않습니다: {step.type!r}"
+        try:
+            delay = float(step.delay)
+        except (TypeError, ValueError):
+            return False, f"{index}번째 단계의 지연시간이 숫자가 아닙니다."
+        if not math.isfinite(delay) or not 0 <= delay <= MAX_STEP_DELAY:
+            return False, f"{index}번째 단계의 지연시간이 허용 범위를 벗어났습니다."
+        if step.type == "click":
+            if step.x is None or step.y is None:
+                return False, f"{index}번째 클릭 단계에 좌표가 없습니다."
+            try:
+                x, y = int(step.x), int(step.y)
+            except (TypeError, ValueError):
+                return False, f"{index}번째 클릭 단계의 좌표가 숫자가 아닙니다."
+            if not (0 <= x < width and 0 <= y < height):
+                return False, f"{index}번째 클릭 좌표가 화면 밖입니다."
+            if step.button not in WorkflowPlayer.BUTTONS:
+                return False, f"{index}번째 클릭의 마우스 버튼이 허용되지 않습니다."
+        elif step.type == "key":
+            if step.event not in {"down", "up"} or step.kind not in {"char", "special"}:
+                return False, f"{index}번째 키 단계의 event/kind가 유효하지 않습니다."
+            value = str(step.value or "")
+            if step.kind == "char" and len(value) != 1:
+                return False, f"{index}번째 문자 키의 길이가 유효하지 않습니다."
+            if step.kind == "special":
+                allowed_specials = set(WorkflowPlayer.KEY_ALIASES) | {f"f{i}" for i in range(1, 13)}
+                if value not in allowed_specials:
+                    return False, f"{index}번째 특수 키 이름이 허용되지 않습니다: {value!r}"
+        elif step.type == "wait":
+            try:
+                seconds = float(step.value or 0.5)
+            except (TypeError, ValueError):
+                return False, f"{index}번째 대기 시간이 숫자가 아닙니다."
+            if not math.isfinite(seconds) or not 0 <= seconds <= 60:
+                return False, f"{index}번째 대기 시간이 허용 범위를 벗어났습니다."
+    return True, "검증 완료"
+
+
+def cleanup_expired_artifacts(max_age_days: int = MAX_CAPTURE_AGE_DAYS) -> None:
+    """Remove old screenshots and error reports while keeping workflow files intact."""
+    ensure_app_dirs()
+    cutoff = time.time() - max(1, int(max_age_days)) * 86400
+    for directory in (CACHE_DIR, ERROR_DIR, DEBUG_DIR):
+        for path in directory.glob("*"):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
 
 def ensure_app_dirs() -> None:
@@ -716,7 +822,7 @@ def capture_observation() -> Dict[str, Any]:
     ensure_app_dirs()
     if pyautogui is None:
         raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
-    image_path = CACHE_DIR / f"observation_{int(time.time())}.png"
+    image_path = CACHE_DIR / f"observation_{time.time_ns()}.png"
     image = pyautogui.screenshot()
     image.save(image_path)
 
@@ -905,6 +1011,9 @@ def save_workflow(workflow: Workflow, path: Path) -> None:
     ensure_app_dirs()
     if not isinstance(workflow, Workflow):
         raise TypeError("Workflow 객체만 저장할 수 있습니다.")
+    valid, reason = validate_workflow(workflow)
+    if not valid:
+        raise ValueError(reason)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2)
@@ -947,6 +1056,8 @@ def validate_ai_steps(
     except ValidationError as exc:
         return False, f"화면 요소 형식 오류: {exc.errors()[0].get('msg', str(exc))}"
     element_map = {element.id: element for element in elements}
+    if len(element_map) != len(elements):
+        return False, "현재 화면 요소에 중복된 element_id가 있습니다."
     raw_size = screen_size or observation.get("screen_size", [])
     if not isinstance(raw_size, (list, tuple)) or len(raw_size) != 2:
         return False, "화면 크기 정보가 올바르지 않습니다. 화면을 다시 관찰하세요."
@@ -980,12 +1091,20 @@ def validate_ai_steps(
                 return False, f"{index}번째 입력값이 없습니다."
             if len(action.text) > MAX_TEXT_INPUT_LENGTH:
                 return False, f"{index}번째 입력값이 너무 깁니다(최대 {MAX_TEXT_INPUT_LENGTH:,}자)."
+            if action.risk == "read" or not action.requires_confirmation:
+                return False, f"{index}번째 입력은 쓰기 동작이므로 사용자 확인이 필요합니다."
+            element_label = " ".join([element.name, element.control_type or ""]).lower()
+            sensitive_terms = ("password", "passwd", "비밀번호", "주민번호", "주민등록", "ssn", "secret", "token")
+            if any(term in element_label for term in sensitive_terms):
+                return False, f"{index}번째 입력 대상이 민감정보 필드로 보입니다. 자동 입력하지 않습니다."
         if action.action == "hotkey":
             keys = tuple(key.lower() for key in action.keys)
             if not 1 <= len(keys) <= 4 or any(key not in safe_hotkeys and not re.fullmatch(r"f([1-9]|1[0-2])", key) for key in keys):
                 return False, f"{index}번째 단축키가 허용되지 않습니다."
-            if set(keys) == {"alt", "f4"} or set(keys) == {"ctrl", "shift", "delete"}:
+            if set(keys) in ({"alt", "f4"}, {"ctrl", "shift", "delete"}, {"ctrl", "alt", "delete"}, {"ctrl", "shift", "esc"}):
                 return False, f"{index}번째 위험 단축키는 자동 실행하지 않습니다."
+            if any(key in {"delete", "enter"} for key in keys) and (action.risk == "read" or not action.requires_confirmation):
+                return False, f"{index}번째 단축키는 쓰기·제출 동작일 수 있어 사용자 확인이 필요합니다."
         if action.action == "scroll" and action.amount == 0:
             return False, f"{index}번째 스크롤 양이 없습니다."
         if action.action == "wait" and not 0 <= action.seconds <= 60:

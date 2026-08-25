@@ -22,6 +22,9 @@ errors/
 debug_snapshots/
 screenshots/
 workflows/
+!.github/
+!.github/workflows/
+!.github/workflows/ci.yml
 
 # IDE / OS
 .vscode/
