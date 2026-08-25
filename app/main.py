@@ -49,6 +49,7 @@ from engine import (
     inspect_workflow,
     validate_workflow,
     verify_workflow_signature,
+    verify_execution_history,
     write_error_report,
     load_workflow,
     save_workflow,
@@ -901,6 +902,11 @@ class AutoWorkAgent(tk.Tk):
         if self.player.running or not self._playback_launch_lock.acquire(blocking=False):
             messagebox.showwarning("재생 중", "이미 다른 작업을 재생 중입니다.")
             return
+        audit = verify_execution_history()
+        if not audit["valid"]:
+            self._playback_launch_lock.release()
+            messagebox.showerror("감사 무결성 오류", "실행 감사 이력의 무결성 검증에 실패했습니다. 원인 확인 전 재생을 중지합니다.")
+            return
         valid, reason = validate_workflow(self.workflow, get_screen_size())
         if not valid:
             self._playback_launch_lock.release()
@@ -1266,6 +1272,11 @@ class AutoWorkAgent(tk.Tk):
         if self.ai_running or not self._ai_job_lock.acquire(blocking=False):
             messagebox.showwarning("AI 실행 중", "다른 AI 작업이 진행 중입니다.")
             return
+        audit = verify_execution_history()
+        if not audit["valid"]:
+            self._ai_job_lock.release()
+            messagebox.showerror("감사 무결성 오류", "실행 감사 이력의 무결성 검증에 실패했습니다. 원인 확인 전 AI 계획 실행을 중지합니다.")
+            return
         valid, reason = validate_ai_steps(
             self.last_plan,
             tuple(self.last_observation.get("screen_size", [100000, 100000])) if self.last_observation else None,
@@ -1558,6 +1569,11 @@ class AutoWorkAgent(tk.Tk):
     def _launch_scheduled_playback(self) -> None:
         if self.recording or self.player.running or not self.workflow.steps:
             append_execution_history("scheduled_run_skipped", self.workflow, reason="busy_or_empty")
+            return
+        audit = verify_execution_history()
+        if not audit["valid"]:
+            append_execution_history("scheduled_run_skipped", self.workflow, reason="audit_integrity_failure")
+            self._set_status("예약 실행 중지 · 감사 이력 무결성 오류")
             return
         valid, reason = validate_workflow(self.workflow, get_screen_size())
         if not valid:
