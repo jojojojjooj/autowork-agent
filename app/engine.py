@@ -64,7 +64,6 @@ MAX_HISTORY_RECORDS_ON_ROTATE = 1_000
 MAX_RUN_REPORTS = 100
 MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
-MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024
 MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
 MAX_CONFIG_FILE_BYTES = 256 * 1024
 AUDIT_HASH_VERSION = 1
@@ -1546,6 +1545,8 @@ def resolve_observed_element(action: UIAction, observation: dict[str, Any]) -> O
     exact = [element for element in elements if element.id == action.element_id]
     if len(exact) == 1:
         return exact[0]
+    if not any((action.element_role, action.element_name, action.element_control_type)):
+        return None
     candidates = elements
     if action.element_role:
         candidates = [element for element in candidates if element.role.casefold() == action.element_role.strip().casefold()]

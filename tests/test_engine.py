@@ -421,6 +421,18 @@ def test_ai_plan_semantic_rebinding_after_element_id_change():
     assert message == "검증 완료"
 
 
+def test_ai_plan_semantic_rebinding_requires_hints():
+    observation = {
+        "screen_size": [1920, 1080],
+        "elements": [{"id": "uia_new", "role": "button", "name": "확인", "control_type": "Button", "bbox": [0, 0, 50, 30], "source": "uia"}],
+    }
+    action = engine.UIAction(action="click", element_id="uia_old", confidence=0.95, risk="read")
+    assert resolve_observed_element(action, observation) is None
+    valid, message = validate_ai_steps({"steps": [action.model_dump()]}, (1920, 1080), observation)
+    assert valid is False
+    assert "현재 화면에 없습니다" in message
+
+
 def test_ai_plan_semantic_rebinding_rejects_ambiguous_elements():
     observation = {
         "screen_size": [1920, 1080],
