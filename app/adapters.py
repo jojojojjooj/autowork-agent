@@ -6,6 +6,8 @@ Document search is bounded to user-approved roots and returns short context snip
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,6 +25,8 @@ MAX_DOCUMENT_ROOTS = 5
 MAX_DOCUMENT_FILES = 40
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_QUERY_CHARS = 4000
+MAX_DOCUMENT_UPDATE_CHARS = 100_000
+TEXT_MUTATION_SUFFIXES = TEXT_SUFFIXES
 DOCUMENT_PII_PATTERNS = (
     (re.compile(r"(?<!\d)\d{6}[- ]\d{7}(?!\d)"), "<주민번호 마스킹>"),
     (re.compile(r"(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)"), "<전화번호 마스킹>"),
@@ -171,6 +175,80 @@ def normalize_document_roots(roots: Iterable[str] | str | None) -> list[Path]:
         if len(resolved) >= MAX_DOCUMENT_ROOTS:
             break
     return resolved
+
+
+def update_approved_text_document(
+    roots: Iterable[str] | str | None,
+    relative_path: str,
+    expected_text: str,
+    replacement: str,
+    *,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Update exactly one text occurrence inside one approved root.
+
+    This is an explicit, local-only mutation API. It requires caller confirmation,
+    rejects traversal/symlinks/unsupported formats, creates a content-addressed
+    backup, and replaces the target atomically. It never sends data externally.
+    """
+    if confirmed is not True:
+        raise PermissionError("문서 변경은 명시적인 사용자 확인이 필요합니다.")
+    approved = normalize_document_roots(roots)
+    if len(approved) != 1:
+        raise ValueError("문서 변경에는 승인된 로컬 루트 하나가 필요합니다.")
+    root = approved[0]
+    raw_relative = str(relative_path or "").strip()
+    if not raw_relative or Path(raw_relative).is_absolute():
+        raise ValueError("문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
+    candidate = root / Path(raw_relative)
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("문서 경로가 승인된 루트 밖에 있습니다.") from exc
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError("변경 대상 문서가 없거나 symlink입니다.")
+    if resolved.suffix.casefold() not in TEXT_MUTATION_SUFFIXES:
+        raise ValueError("변경은 승인된 텍스트 문서 확장자만 지원합니다.")
+    try:
+        current = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("문서를 UTF-8 텍스트로 읽을 수 없습니다.") from exc
+    old = str(expected_text or "")
+    new = str(replacement or "")
+    if not old or len(old) > MAX_DOCUMENT_UPDATE_CHARS or len(new) > MAX_DOCUMENT_UPDATE_CHARS:
+        raise ValueError(f"변경 문자열은 1~{MAX_DOCUMENT_UPDATE_CHARS:,}자여야 합니다.")
+    if current.count(old) != 1:
+        raise ValueError("변경 전 확인 문자열은 문서에서 정확히 한 번만 나타나야 합니다.")
+    updated = current.replace(old, new, 1)
+    before_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
+    after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
+    backup_name = f".{resolved.name}.autowork-{before_hash[:12]}.bak"
+    backup = resolved.with_name(backup_name)
+    temporary_backup = backup.with_name(f".{backup.name}.tmp")
+    temporary_target = resolved.with_name(f".{resolved.name}.tmp")
+    try:
+        temporary_backup.write_text(current, encoding="utf-8")
+        os.replace(temporary_backup, backup)
+        temporary_target.write_text(updated, encoding="utf-8")
+        os.replace(temporary_target, resolved)
+    except OSError as exc:
+        for temporary in (temporary_backup, temporary_target):
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+        raise OSError(f"문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc
+    return {
+        "relative_path": str(resolved.relative_to(root)),
+        "extension": resolved.suffix.casefold(),
+        "backup_relative_path": str(backup.relative_to(root)),
+        "before_sha256": before_hash,
+        "after_sha256": after_hash,
+        "changed_chars": len(new) - len(old),
+        "confirmed": True,
+    }
 
 
 def _query_tokens(query: str) -> list[str]:

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from app import engine
 from app.engine import (
     Step,
@@ -24,6 +26,7 @@ from app.engine import (
     verify_workflow_signature,
     write_execution_report,
 )
+from app.adapters import update_approved_text_document
 from app.policies import review_plan
 
 
@@ -159,3 +162,42 @@ def test_scenario_ai_preflight_approves_read_only_and_blocks_unsafe_plan():
     unsafe_valid, unsafe_reason = validate_ai_steps(unsafe_plan, (1920, 1080), {"elements": []}, "standard")
     assert unsafe_valid is False
     assert "형식 오류" in unsafe_reason or "허용" in unsafe_reason
+
+
+def test_scenario_confirmed_document_change_creates_backup_and_verifies_result(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "report.md"
+    original = "# 월간 보고서\n상태: 초안\n담당: 내부 검토\n"
+    document.write_text(original, encoding="utf-8")
+
+    try:
+        update_approved_text_document([str(approved)], "report.md", "상태: 초안", "상태: 승인 대기", confirmed=False)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("명시적 확인 없는 문서 변경이 허용되었습니다.")
+
+    result = update_approved_text_document(
+        [str(approved)],
+        "report.md",
+        "상태: 초안",
+        "상태: 승인 대기",
+        confirmed=True,
+    )
+    assert document.read_text(encoding="utf-8") == original.replace("상태: 초안", "상태: 승인 대기")
+    backup = approved / result["backup_relative_path"]
+    assert backup.read_text(encoding="utf-8") == original
+    assert result["before_sha256"] != result["after_sha256"]
+    assert result["confirmed"] is True
+    assert "상태: 초안" not in json.dumps(result, ensure_ascii=False)
+
+    with pytest.raises(ValueError, match="루트 밖"):
+        update_approved_text_document([str(approved)], "../outside.md", "상태", "상태", confirmed=True)
+    unsupported = approved / "report.pdf"
+    unsupported.write_text("상태", encoding="utf-8")
+    with pytest.raises(ValueError, match="확장자"):
+        update_approved_text_document([str(approved)], "report.pdf", "상태", "변경", confirmed=True)
+    document.write_text("상태: 승인 대기\n상태: 승인 대기", encoding="utf-8")
+    with pytest.raises(ValueError, match="정확히 한 번"):
+        update_approved_text_document([str(approved)], "report.md", "상태: 승인 대기", "상태: 완료", confirmed=True)
