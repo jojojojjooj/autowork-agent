@@ -1,8 +1,8 @@
 pynput==1.7.7
 defusedxml==0.7.1
 PyAutoGUI==0.9.54
-Pillow==11.3.0
-requests==2.32.4
+Pillow==12.3.0
+requests==2.34.2
 pydantic==2.11.7
 pyperclip==1.9.0
 pywinauto==0.6.9

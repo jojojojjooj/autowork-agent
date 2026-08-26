@@ -38,3 +38,18 @@ jobs:
         run: python -m py_compile app/engine.py app/main.py app/adapters.py app/policies.py app/release.py
       - name: Validate Windows release layout
         run: python -m app.release .
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install audit tool
+        run: python -m pip install --disable-pip-version-check pip-audit==2.9.0
+      - name: Audit pinned dependencies
+        run: pip-audit -r requirements.lock.txt

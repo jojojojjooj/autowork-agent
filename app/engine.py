@@ -110,6 +110,22 @@ def atomic_write_text(path: Path, content: str) -> None:
     atomic_write_bytes(Path(path), content.encode("utf-8"))
 
 
+def _files_by_mtime(directory: Path, pattern: str) -> List[Path]:
+    """Return regular files ordered by mtime while tolerating concurrent deletion."""
+    candidates: List[tuple[Path, float]] = []
+    try:
+        for path in directory.glob(pattern):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    candidates.append((path, path.stat().st_mtime))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [path for path, _mtime in candidates]
+
+
 def redact_sensitive(value: Any) -> Any:
     """Redact values that may contain typed text or credentials in diagnostics."""
     if isinstance(value, dict):
@@ -461,7 +477,7 @@ def export_support_bundle(target: Path) -> Path:
     ensure_app_dirs()
     logs = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-300:] if LOG_PATH.exists() else []
     errors = []
-    for path in sorted(ERROR_DIR.glob("error_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:50]:
+    for path in _files_by_mtime(ERROR_DIR, "error_*.json")[:50]:
         try:
             errors.append({"name": path.name, "size_bytes": path.stat().st_size})
         except OSError:
@@ -545,7 +561,7 @@ def read_execution_reports(limit: int = 100) -> List[Dict[str, Any]]:
         "version", "created_at", "run_id", "event", "mode", "workflow", "step_count",
         "start_step", "last_step", "duration_seconds", "error_type", "policy_profile",
     )
-    for path in sorted(RUN_REPORT_DIR.glob("run_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:count]:
+    for path in _files_by_mtime(RUN_REPORT_DIR, "run_*.json")[:count]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or data.get("version") != 1:
@@ -1627,7 +1643,7 @@ def capture_observation() -> Dict[str, Any]:
                     bbox = [rect.left, rect.top, rect.right, rect.bottom]
                     automation_id = str(getattr(control.element_info, "automation_id", "") or "")
                     identity = f"{automation_id}|{control_type}|{name}|{bbox}"
-                    element_id = "uia_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+                    element_id = "uia_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
                     role = {
                         "Button": "button", "Edit": "edit", "CheckBox": "checkbox", "RadioButton": "radio",
                         "Hyperlink": "link", "Menu": "menu", "List": "list", "TabItem": "tab", "Text": "text",
@@ -1832,7 +1848,7 @@ def cleanup_workflow_backups(max_backups: int = MAX_WORKFLOW_BACKUPS) -> None:
     ensure_app_dirs()
     try:
         limit = max(1, int(max_backups))
-        backups = sorted((path for path in BACKUP_DIR.glob("*.json") if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+        backups = _files_by_mtime(BACKUP_DIR, "*.json")
         for path in backups[limit:]:
             try:
                 path.unlink()
@@ -1860,8 +1876,8 @@ def list_workflow_backups(workflow_path: Path | None = None) -> List[Path]:
     """List newest local workflow backups, optionally filtered by original stem."""
     ensure_app_dirs()
     stem = Path(workflow_path).stem if workflow_path else None
-    paths = [path for path in BACKUP_DIR.glob("*.json") if path.is_file() and (stem is None or path.name.startswith(f"{stem}_"))]
-    return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)
+    paths = [path for path in _files_by_mtime(BACKUP_DIR, "*.json") if stem is None or path.name.startswith(f"{stem}_")]
+    return paths
 
 
 def save_workflow(workflow: Workflow, path: Path) -> Optional[Path]:
