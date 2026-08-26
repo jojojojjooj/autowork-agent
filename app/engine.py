@@ -775,6 +775,60 @@ def validate_timeout(value: Any) -> int:
     return timeout
 
 
+def validate_runtime_config(data: Any, defaults: Optional[Dict[str, Any]] = None) -> tuple[Dict[str, Any], List[str]]:
+    """Return a bounded local configuration and fields that were reset after validation."""
+    safe_defaults: Dict[str, Any] = {
+        "endpoint": "http://127.0.0.1:11434/v1",
+        "model": "gemma4:e2b",
+        "timeout": 120,
+        "vision": False,
+        "capture_on_error": True,
+        "dry_run": True,
+        "schedule_interval": 3600,
+        "document_roots": [],
+    }
+    if isinstance(defaults, dict):
+        safe_defaults.update(defaults)
+    raw = data if isinstance(data, dict) else {}
+    result = dict(safe_defaults)
+    reset_fields: List[str] = []
+
+    try:
+        result["endpoint"] = validate_local_endpoint(raw.get("endpoint", safe_defaults["endpoint"]))
+    except (TypeError, ValueError):
+        reset_fields.append("endpoint")
+    model = raw.get("model", safe_defaults["model"])
+    if isinstance(model, str) and 1 <= len(model.strip()) <= 200:
+        result["model"] = model.strip()
+    else:
+        reset_fields.append("model")
+    profile = raw.get("policy_profile", safe_defaults.get("policy_profile", "standard"))
+    if isinstance(profile, str) and 1 <= len(profile.strip()) <= 80:
+        result["policy_profile"] = profile.strip()
+    else:
+        reset_fields.append("policy_profile")
+    try:
+        result["timeout"] = validate_timeout(raw.get("timeout", safe_defaults["timeout"]))
+    except (TypeError, ValueError):
+        reset_fields.append("timeout")
+    for field_name in ("vision", "capture_on_error", "dry_run"):
+        value = raw.get(field_name, safe_defaults[field_name])
+        if isinstance(value, bool):
+            result[field_name] = value
+        else:
+            reset_fields.append(field_name)
+    try:
+        result["schedule_interval"] = validate_schedule_interval(raw.get("schedule_interval", safe_defaults["schedule_interval"]))
+    except (TypeError, ValueError):
+        reset_fields.append("schedule_interval")
+    roots = raw.get("document_roots", safe_defaults["document_roots"])
+    if isinstance(roots, list) and all(isinstance(item, str) for item in roots):
+        result["document_roots"] = roots[:5]
+    else:
+        reset_fields.append("document_roots")
+    return result, reset_fields
+
+
 class ObservedElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

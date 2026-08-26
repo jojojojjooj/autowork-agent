@@ -62,6 +62,7 @@ from engine import (
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
+    validate_runtime_config,
     validate_schedule_interval,
     save_prompt_template,
     load_prompt_template,
@@ -1545,14 +1546,23 @@ class AutoWorkAgent(tk.Tk):
             self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
 
     def _load_config(self) -> None:
-        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": "120", "vision": False, "capture_on_error": True, "schedule_interval": 3600, "policy_profile": DEFAULT_POLICY_PROFILE, "document_roots": []}
+        defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": 120, "vision": False, "capture_on_error": True, "dry_run": True, "schedule_interval": 3600, "policy_profile": DEFAULT_POLICY_PROFILE, "document_roots": []}
         data: Dict[str, Any] = {}
+        config_file_invalid = False
         try:
             if CONFIG_PATH.exists():
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        self._config_data = {**defaults, **data}
+                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+                else:
+                    config_file_invalid = True
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            config_file_invalid = True
+        self._config_data, reset_fields = validate_runtime_config(data, defaults)
+        if config_file_invalid:
+            reset_fields.insert(0, "file")
+        if reset_fields:
+            append_log(f"설정 검증으로 안전 기본값 복원: {', '.join(reset_fields[:10])}", "WARNING")
         self.dry_run_enabled = bool(self._config_data.get("dry_run", True))
         self.capture_on_error_enabled = bool(self._config_data.get("capture_on_error", True))
 
