@@ -12,6 +12,7 @@ from app.release import validate_release_layout
 from app.engine import (
     LocalAIClient,
     LocalScheduler,
+    atomic_write_text,
     Step,
     Workflow,
     WorkflowPlayer,
@@ -592,6 +593,15 @@ def test_runtime_config_validation_resets_unsafe_values():
     assert config["schedule_interval"] == 3600
     assert config["document_roots"] == []
     assert {"endpoint", "model", "timeout", "vision", "schedule_interval", "document_roots"}.issubset(reset_fields)
+
+
+def test_atomic_write_text_replaces_without_leaving_deterministic_temp(tmp_path: Path):
+    target = tmp_path / "state.json"
+    atomic_write_text(target, "first")
+    atomic_write_text(target, "second")
+    assert target.read_text(encoding="utf-8") == "second"
+    assert list(tmp_path.glob("state.json.tmp")) == []
+    assert list(tmp_path.glob(".state.json.tmp")) == []
 
 
 def test_runtime_config_loader_rejects_oversized_and_malformed_files(tmp_path: Path):

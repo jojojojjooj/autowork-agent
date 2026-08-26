@@ -32,6 +32,7 @@ from engine import (
     get_screen_size,
     WorkflowPlayer,
     append_log,
+    atomic_write_text,
     append_execution_history,
     build_execution_report_dashboard,
     export_execution_report_summary,
@@ -1572,9 +1573,7 @@ class AutoWorkAgent(tk.Tk):
                 "policy_profile": self._current_policy_profile(),
                 "document_roots": [str(path) for path in normalize_document_roots(self.document_roots_var.get())],
             }
-            temp_path = CONFIG_PATH.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            temp_path.replace(CONFIG_PATH)
+            atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
             self._set_status("로컬 AI 설정 저장 완료")
         except Exception as exc:
             messagebox.showerror("설정 저장 실패", str(exc))
