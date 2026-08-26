@@ -112,7 +112,7 @@ Ollama나 LM Studio를 로컬에서 실행한 뒤 **설정** 탭에서 주소와
 
 ## 테스트 및 빌드
 
-개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 69개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다. 문서 경계조건까지 포함한 모든 문서 시나리오는 `python -m pytest -q tests/test_scenarios.py -k 'document or real_docx or real_xlsx'`로 실행하고, 실제 DOCX·XLSX 변경만 확인하려면 `python -m pytest -q tests/test_scenarios.py -k 'real_docx or real_xlsx'`를 사용합니다. Linux에서 실제 Tkinter 창의 시작·종료를 확인하려면 `xvfb-run -a python tests/gui_smoke.py`를 사용합니다. GUI smoke는 격리된 임시 `LOCALAPPDATA`를 사용하고 종료 후 자동 삭제하므로 저장소에 설정·로그 아티팩트를 남기지 않습니다. 로컬 문서 검색은 임시 승인 디렉터리만 대상으로 합니다.
+개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 70개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다. 문서 경계조건까지 포함한 모든 문서 시나리오는 `python -m pytest -q tests/test_scenarios.py -k 'document or real_docx or real_xlsx'`로 실행하고, 실제 DOCX·XLSX 변경만 확인하려면 `python -m pytest -q tests/test_scenarios.py -k 'real_docx or real_xlsx'`를 사용합니다. Linux에서 실제 Tkinter 창의 시작·종료를 확인하려면 `xvfb-run -a python tests/gui_smoke.py`를 사용합니다. GUI smoke는 격리된 임시 `LOCALAPPDATA`를 사용하고 종료 후 자동 삭제하므로 저장소에 설정·로그 아티팩트를 남기지 않습니다. 로컬 문서 검색은 임시 승인 디렉터리만 대상으로 합니다.
  GitHub Actions는 Ubuntu와 Windows runner에서 Python 3.11·3.12 조합을 검증하고, Windows 배포 레이아웃 정적 검사도 수행합니다. 별도 Dependency audit job은 `requirements.lock.txt`의 고정 의존성을 `pip-audit`으로 검사해 알려진 취약 버전의 병합을 차단합니다.
 
 ```powershell

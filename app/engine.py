@@ -976,7 +976,7 @@ class Workflow:
         allowed_buttons = {"left", "right", "middle", "x1", "x2"}
         allowed_fields = set(Step.__dataclass_fields__)
         for index, raw in enumerate(raw_steps, start=1):
-            if not isinstance(raw, dict) or raw.get("type") not in allowed_types:
+            if not isinstance(raw, dict) or not isinstance(raw.get("type"), str) or raw.get("type") not in allowed_types:
                 raise ValueError(f"{index}번째 단계의 동작 유형이 올바르지 않습니다.")
             unknown = set(raw) - allowed_fields
             if unknown:
@@ -992,12 +992,16 @@ class Workflow:
             if not math.isfinite(delay) or not 0 <= delay <= MAX_STEP_DELAY:
                 raise ValueError(f"{index}번째 단계의 대기 시간은 0~60초여야 합니다.")
             if step.type == "click":
-                if step.x is None or step.y is None or not (-100_000 <= int(step.x) <= 100_000) or not (-100_000 <= int(step.y) <= 100_000):
+                try:
+                    x, y = int(step.x), int(step.y)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"{index}번째 클릭 좌표가 올바르지 않습니다.") from exc
+                if not (-100_000 <= x <= 100_000 and -100_000 <= y <= 100_000):
                     raise ValueError(f"{index}번째 클릭 좌표가 올바르지 않습니다.")
-                if step.button not in allowed_buttons:
+                if not isinstance(step.button, str) or step.button not in allowed_buttons:
                     raise ValueError(f"{index}번째 마우스 버튼이 올바르지 않습니다.")
             elif step.type == "key":
-                if step.event not in {"down", "up"} or step.kind not in {"char", "special"} or not step.value or len(step.value) > 32:
+                if not isinstance(step.event, str) or not isinstance(step.kind, str) or not isinstance(step.value, str) or step.event not in {"down", "up"} or step.kind not in {"char", "special"} or not step.value or len(step.value) > 32:
                     raise ValueError(f"{index}번째 키 입력 형식이 올바르지 않습니다.")
                 if step.kind == "special":
                     allowed_specials = set(WorkflowPlayer.KEY_ALIASES) | {f"f{i}" for i in range(1, 13)}
@@ -1027,7 +1031,7 @@ class Workflow:
                 raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.")
             try:
                 recorded_screen_size = [int(recorded_screen_size[0]), int(recorded_screen_size[1])]
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.") from exc
             if any(value <= 0 for value in recorded_screen_size):
                 raise ValueError("기록 당시 화면 크기는 양수여야 합니다.")
@@ -1486,6 +1490,8 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
     """Validate persisted or recorded workflows before OS-level input is sent."""
     if not isinstance(workflow, Workflow):
         return False, "유효하지 않은 작업 객체입니다."
+    if not isinstance(workflow.steps, list):
+        return False, "작업 단계 형식이 올바르지 않습니다. 배열이 필요합니다."
     if len(workflow.steps) > MAX_WORKFLOW_STEPS:
         return False, f"작업 단계는 {MAX_WORKFLOW_STEPS:,}개를 초과할 수 없습니다."
     width, height = 100000, 100000
@@ -1497,7 +1503,7 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
         if width <= 0 or height <= 0:
             return False, "화면 크기는 양수여야 합니다."
     for index, step in enumerate(workflow.steps, start=1):
-        if step.type not in {"click", "key", "wait"}:
+        if not isinstance(step.type, str) or step.type not in {"click", "key", "wait"}:
             return False, f"{index}번째 단계의 동작이 허용되지 않습니다: {step.type!r}"
         try:
             delay = float(step.delay)
@@ -1510,16 +1516,16 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
                 return False, f"{index}번째 클릭 단계에 좌표가 없습니다."
             try:
                 x, y = int(step.x), int(step.y)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return False, f"{index}번째 클릭 단계의 좌표가 숫자가 아닙니다."
             if not (0 <= x < width and 0 <= y < height):
                 return False, f"{index}번째 클릭 좌표가 화면 밖입니다."
-            if step.button not in WorkflowPlayer.BUTTONS:
+            if not isinstance(step.button, str) or step.button not in WorkflowPlayer.BUTTONS:
                 return False, f"{index}번째 클릭의 마우스 버튼이 허용되지 않습니다."
         elif step.type == "key":
-            if step.event not in {"down", "up"} or step.kind not in {"char", "special"}:
+            if not isinstance(step.event, str) or not isinstance(step.kind, str) or not isinstance(step.value, str) or step.event not in {"down", "up"} or step.kind not in {"char", "special"}:
                 return False, f"{index}번째 키 단계의 event/kind가 유효하지 않습니다."
-            value = str(step.value or "")
+            value = step.value
             if step.kind == "char" and len(value) != 1:
                 return False, f"{index}번째 문자 키의 길이가 유효하지 않습니다."
             if step.kind == "special":
@@ -1562,7 +1568,7 @@ def resolve_observed_element(action: UIAction, observation: dict[str, Any]) -> O
 def inspect_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> dict[str, Any]:
     """Return a non-destructive safety and readiness report for a workflow."""
     valid, reason = validate_workflow(workflow, screen_size)
-    steps = list(workflow.steps) if isinstance(workflow, Workflow) else []
+    steps = list(workflow.steps) if isinstance(workflow, Workflow) and isinstance(workflow.steps, list) else []
     current_size = tuple(int(value) for value in screen_size) if screen_size else None
     recorded_size = tuple(workflow.recorded_screen_size) if isinstance(workflow, Workflow) and workflow.recorded_screen_size else None
     warnings: list[str] = []

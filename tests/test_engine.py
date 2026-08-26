@@ -468,6 +468,15 @@ def test_workflow_inspection_reports_counts_and_screen_warning():
     assert report["warnings"]
 
 
+def test_workflow_validation_rejects_malformed_in_memory_steps():
+    malformed = Workflow(steps=None)
+    valid, message = validate_workflow(malformed, (1920, 1080))
+    assert valid is False
+    assert "배열" in message
+    report = inspect_workflow(malformed, (1920, 1080))
+    assert report["valid"] is False
+
+
 def test_workflow_rejects_out_of_bounds_click():
     valid, message = validate_workflow(Workflow(steps=[Step(type="click", x=-1, y=10, button="left")]), (1920, 1080))
     assert valid is False
