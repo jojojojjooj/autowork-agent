@@ -30,6 +30,7 @@
 | Windows Smoke CI | GitHub Windows runner에서 런타임 import·회귀 테스트·PyInstaller 산출물 확인 | `.github/workflows/windows-smoke.yml` |
 | 사용자 흐름 시나리오 | 저장·서명·재로드·재생·복구·AI 사전검토를 실제 순서로 검증 | `tests/test_scenarios.py` |
 | 문서 변경 시나리오 | 임시 승인 루트의 텍스트 문서를 명시적 확인·백업·원자 저장 후 변경하고 결과 검증 | `tests/test_scenarios.py -k document_change` |
+| Office 문서 변경 시나리오 | 실제 DOCX·XLSX OOXML 패키지를 변경하고 백업·ZIP 무결성·XML 재오픈을 검증 | `tests/test_scenarios.py -k 'real_docx or real_xlsx'` |
 | 사전 검토 | 실행 전 단계 수·동작/위험도·총 대기시간·결과 확인 문구·정책 위반 사유 요약 | 로컬 결정적 검토 |
 | 엔터프라이즈 모니터링 | 운영 상태 heartbeat, 실패·성공률 경보, run_id 기반 실행 추적, 감사 해시 체인, 개인정보 제외 지원 패키지 | 로컬 JSON 상태·진단 패키지 |
 | 실행 리포트 | 실행별 성공·실패·중지, 단계 범위, 소요시간, 오류 유형, 정책 프로필 요약 | 로컬 JSON 원자 저장·최대 100개 |
@@ -85,7 +86,7 @@ Windows 10/11과 Python 3.11 이상을 권장합니다. 저장소 전체를 Wind
 
 Ollama나 LM Studio를 로컬에서 실행한 뒤 **설정** 탭에서 주소와 모델 이름을 지정합니다. 주소는 루프백 호스트와 `/v1` 경로만 허용하며 인증정보·query string·fragment·외부 호스트는 차단됩니다. 응답 제한 시간은 5~600초로 제한됩니다. **연결 점검**은 사용자 데이터나 프롬프트를 보내지 않고 `/models` 응답만 확인해 서버 도달 여부와 모델 목록을 보여줍니다.
 
-화면 이미지를 로컬 모델에 보내려면 해당 모델이 비전 입력을 지원하는지 확인한 뒤 설정하십시오. OCR과 오류 캡처에는 이메일·전화번호·주민등록번호 형식의 문자열을 가능한 범위에서 마스킹합니다. 화면 관찰 결과에는 Excel 셀·범위와 PDF 페이지 같은 읽기 전용 대상 단서가 포함될 수 있지만, 이 어댑터는 파일을 열어 쓰거나 문서를 수정하지 않습니다. Windows 배포 전에는 `python -m app.release .`로 필수 파일·고정 의존성·배치 스크립트 표식을 정적으로 점검할 수 있습니다. 이 검사는 설치·실행·빌드를 직접 수행하지 않습니다. push 또는 pull request 시 `.github/workflows/windows-smoke.yml`이 GitHub Windows runner에서 고정 의존성 설치, Windows 런타임 import, 전체 회귀 테스트, 사용자 흐름 시나리오 테스트, PyInstaller 실행 파일 생성 여부를 별도로 확인합니다. 시나리오 테스트는 실제 OS 입력 대신 통제된 local fake를 사용해 저장·서명·재생·복구·AI 안전 게이트의 순서를 검증하며, 업무용 대상 앱을 조작하지는 않습니다. 문서 변경 시나리오는 임시 승인 루트의 텍스트 fixture만 실제로 변경하고, 명시적 확인·경로 탈출 차단·백업·원자 저장·변경 후 해시 검증을 수행합니다.
+화면 이미지를 로컬 모델에 보내려면 해당 모델이 비전 입력을 지원하는지 확인한 뒤 설정하십시오. OCR과 오류 캡처에는 이메일·전화번호·주민등록번호 형식의 문자열을 가능한 범위에서 마스킹합니다. 화면 관찰 결과에는 Excel 셀·범위와 PDF 페이지 같은 읽기 전용 대상 단서가 포함될 수 있지만, 이 어댑터는 파일을 열어 쓰거나 문서를 수정하지 않습니다. Windows 배포 전에는 `python -m app.release .`로 필수 파일·고정 의존성·배치 스크립트 표식을 정적으로 점검할 수 있습니다. 이 검사는 설치·실행·빌드를 직접 수행하지 않습니다. push 또는 pull request 시 `.github/workflows/windows-smoke.yml`이 GitHub Windows runner에서 고정 의존성 설치, Windows 런타임 import, 전체 회귀 테스트, 사용자 흐름 시나리오 테스트, PyInstaller 실행 파일 생성 여부를 별도로 확인합니다. 시나리오 테스트는 실제 OS 입력 대신 통제된 local fake를 사용해 저장·서명·재생·복구·AI 안전 게이트의 순서를 검증하며, 업무용 대상 앱을 조작하지는 않습니다. 문서 변경 시나리오는 임시 승인 루트의 텍스트 fixture와 실제 DOCX·XLSX OOXML fixture만 변경하고, 명시적 확인·경로 탈출 차단·백업·원자 저장·변경 후 해시 및 ZIP/XML 재오픈 검증을 수행합니다. 사용자 문서나 운영 데이터는 테스트 대상이 아닙니다.
  로컬 AI가 없어도 기록·재생은 독립적으로 사용할 수 있습니다.
 
 ### 예약 실행
@@ -108,7 +109,7 @@ Ollama나 LM Studio를 로컬에서 실행한 뒤 **설정** 탭에서 주소와
 
 ## 테스트 및 빌드
 
-개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 55개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다.
+개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 57개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다. 실제 DOCX·XLSX 변경만 확인하려면 `python -m pytest -q tests/test_scenarios.py -k 'real_docx or real_xlsx'`를 사용합니다.
  로컬 문서 검색은 임시 승인 디렉터리만 대상으로 합니다.
  GitHub Actions는 Ubuntu와 Windows runner에서 Python 3.11·3.12 조합을 검증하고, Windows 배포 레이아웃 정적 검사도 수행합니다.
 

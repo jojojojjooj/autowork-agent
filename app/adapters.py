@@ -7,8 +7,11 @@ Document search is bounded to user-approved roots and returns short context snip
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
+import zipfile
+from html import escape as xml_escape
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +30,8 @@ MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_QUERY_CHARS = 4000
 MAX_DOCUMENT_UPDATE_CHARS = 100_000
 TEXT_MUTATION_SUFFIXES = TEXT_SUFFIXES
+OFFICE_MUTATION_SUFFIXES = {".docx", ".xlsx"}
+MAX_OFFICE_PACKAGE_BYTES = 20 * 1024 * 1024
 DOCUMENT_PII_PATTERNS = (
     (re.compile(r"(?<!\d)\d{6}[- ]\d{7}(?!\d)"), "<주민번호 마스킹>"),
     (re.compile(r"(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)"), "<전화번호 마스킹>"),
@@ -247,6 +252,116 @@ def update_approved_text_document(
         "before_sha256": before_hash,
         "after_sha256": after_hash,
         "changed_chars": len(new) - len(old),
+        "confirmed": True,
+    }
+
+
+def update_approved_office_document(
+    roots: Iterable[str] | str | None,
+    relative_path: str,
+    expected_text: str,
+    replacement: str,
+    *,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Safely update one text occurrence in a DOCX or XLSX OOXML package."""
+    if confirmed is not True:
+        raise PermissionError("Office 문서 변경은 명시적인 사용자 확인이 필요합니다.")
+    approved = normalize_document_roots(roots)
+    if len(approved) != 1:
+        raise ValueError("Office 문서 변경에는 승인된 로컬 루트 하나가 필요합니다.")
+    root = approved[0]
+    raw_relative = str(relative_path or "").strip()
+    if not raw_relative or Path(raw_relative).is_absolute():
+        raise ValueError("Office 문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
+    candidate = root / Path(raw_relative)
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("Office 문서 경로가 승인된 루트 밖에 있습니다.") from exc
+    suffix = resolved.suffix.casefold()
+    if suffix not in OFFICE_MUTATION_SUFFIXES:
+        raise ValueError("Office 문서 변경은 .docx 또는 .xlsx만 지원합니다.")
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError("변경 대상 Office 문서가 없거나 symlink입니다.")
+    try:
+        original = resolved.read_bytes()
+    except OSError as exc:
+        raise ValueError("Office 문서를 읽을 수 없습니다.") from exc
+    if len(original) > MAX_OFFICE_PACKAGE_BYTES or not zipfile.is_zipfile(io.BytesIO(original)):
+        raise ValueError("유효하지 않거나 허용 크기를 초과한 Office 문서입니다.")
+    expected = str(expected_text or "")
+    replacement_text = str(replacement or "")
+    if not expected or len(expected) > MAX_DOCUMENT_UPDATE_CHARS or len(replacement_text) > MAX_DOCUMENT_UPDATE_CHARS:
+        raise ValueError(f"변경 문자열은 1~{MAX_DOCUMENT_UPDATE_CHARS:,}자여야 합니다.")
+    escaped_expected = xml_escape(expected, quote=False)
+    escaped_replacement = xml_escape(replacement_text, quote=False)
+    target_prefix = "word/" if suffix == ".docx" else "xl/"
+    match_parts: list[tuple[str, bytes]] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(original), "r") as archive:
+            infos = archive.infolist()
+            if sum(max(0, int(info.file_size)) for info in infos) > MAX_OFFICE_PACKAGE_BYTES:
+                raise ValueError("Office 문서의 압축 해제 크기가 허용 범위를 초과합니다.")
+            for info in infos:
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/"):
+                    raise ValueError("Office 패키지 내부 경로가 안전하지 않습니다.")
+                if not name.endswith(".xml") or not name.startswith(target_prefix):
+                    continue
+                if suffix == ".docx" and not name.startswith("word/document"):
+                    continue
+                if suffix == ".xlsx" and not (name.startswith("xl/worksheets/") or name == "xl/sharedStrings.xml"):
+                    continue
+                match_parts.append((name, archive.read(info)))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError("Office 문서 패키지를 읽을 수 없습니다.") from exc
+    matches = [(name, data.count(escaped_expected.encode("utf-8"))) for name, data in match_parts]
+    if sum(count for _, count in matches) != 1:
+        raise ValueError("변경 전 확인 문자열은 대상 Office 문서에서 정확히 한 번만 나타나야 합니다.")
+    changed_part = next(name for name, count in matches if count == 1)
+    before_hash = hashlib.sha256(original).hexdigest()
+    updated_buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(original), "r") as source, zipfile.ZipFile(updated_buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            data = source.read(info)
+            if info.filename.replace("\\", "/") == changed_part:
+                data = data.replace(escaped_expected.encode("utf-8"), escaped_replacement.encode("utf-8"), 1)
+            target.writestr(info, data)
+    updated = updated_buffer.getvalue()
+    try:
+        with zipfile.ZipFile(io.BytesIO(updated), "r") as archive:
+            if archive.testzip() is not None:
+                raise ValueError("변경 후 Office 문서의 압축 무결성 검증에 실패했습니다.")
+            archive.read(changed_part)
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError("변경 후 Office 문서를 다시 열 수 없습니다.") from exc
+    after_hash = hashlib.sha256(updated).hexdigest()
+    backup = resolved.with_name(f".{resolved.name}.autowork-{before_hash[:12]}.bak")
+    temporary_backup = backup.with_name(f".{backup.name}.tmp")
+    temporary_target = resolved.with_name(f".{resolved.name}.tmp")
+    try:
+        temporary_backup.write_bytes(original)
+        os.replace(temporary_backup, backup)
+        temporary_target.write_bytes(updated)
+        os.replace(temporary_target, resolved)
+    except OSError as exc:
+        for temporary in (temporary_backup, temporary_target):
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+        raise OSError(f"Office 문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc
+    return {
+        "relative_path": str(resolved.relative_to(root)),
+        "extension": suffix,
+        "changed_part": changed_part,
+        "backup_relative_path": str(backup.relative_to(root)),
+        "before_sha256": before_hash,
+        "after_sha256": after_hash,
+        "changed_chars": len(replacement_text) - len(expected),
         "confirmed": True,
     }
 

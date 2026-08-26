@@ -45,6 +45,11 @@ jobs:
         env:
           PYTHONPATH: .
         run: python -m pytest -q tests/test_scenarios.py -k document_change
+      - name: Run real Office document mutation scenarios
+        shell: pwsh
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q tests/test_scenarios.py -k "real_docx or real_xlsx"
       - name: Compile Python sources
         shell: pwsh
         run: python -m py_compile app/engine.py app/main.py app/adapters.py app/policies.py app/release.py

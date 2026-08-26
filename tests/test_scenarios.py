@@ -6,7 +6,11 @@ and AI safety gates without sending real OS input or external network traffic.
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
+from html import escape as xml_escape
+from xml.etree import ElementTree
 from pathlib import Path
 
 import pytest
@@ -26,8 +30,26 @@ from app.engine import (
     verify_workflow_signature,
     write_execution_report,
 )
-from app.adapters import update_approved_text_document
+from app.adapters import update_approved_office_document, update_approved_text_document
 from app.policies import review_plan
+
+
+def _write_office_fixture(path: Path, suffix: str, text: str) -> None:
+    escaped = xml_escape(text, quote=False)
+    if suffix == ".docx":
+        parts = {
+            "[Content_Types].xml": "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>",
+            "word/document.xml": f"<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>{escaped}</w:t></w:r></w:p></w:body></w:document>",
+        }
+    else:
+        parts = {
+            "[Content_Types].xml": "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>",
+            "xl/workbook.xml": "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets/></workbook>",
+            "xl/worksheets/sheet1.xml": f"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>{escaped}</t></is></c></row></sheetData></worksheet>",
+        }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content.encode("utf-8"))
 
 
 class FakePyAutoGUI:
@@ -201,3 +223,44 @@ def test_scenario_confirmed_document_change_creates_backup_and_verifies_result(t
     document.write_text("상태: 승인 대기\n상태: 승인 대기", encoding="utf-8")
     with pytest.raises(ValueError, match="정확히 한 번"):
         update_approved_text_document([str(approved)], "report.md", "상태: 승인 대기", "상태: 완료", confirmed=True)
+
+
+def test_scenario_real_docx_mutation_reopens_and_preserves_backup(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "report.docx"
+    _write_office_fixture(document, ".docx", "상태: 초안")
+    original = document.read_bytes()
+
+    result = update_approved_office_document([str(approved)], "report.docx", "상태: 초안", "상태: 승인 대기", confirmed=True)
+    changed = document.read_bytes()
+    assert changed != original
+    assert result["extension"] == ".docx"
+    assert result["changed_part"] == "word/document.xml"
+    assert (approved / result["backup_relative_path"]).read_bytes() == original
+    with zipfile.ZipFile(io.BytesIO(changed), "r") as archive:
+        assert archive.testzip() is None
+        xml = archive.read("word/document.xml")
+        ElementTree.fromstring(xml)
+        assert b"%EC%83%81%ED%83%9C" not in xml
+        assert "상태: 승인 대기" in xml.decode("utf-8")
+
+
+def test_scenario_real_xlsx_mutation_reopens_and_preserves_backup(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "budget.xlsx"
+    _write_office_fixture(document, ".xlsx", "합계: 100")
+    original = document.read_bytes()
+
+    result = update_approved_office_document([str(approved)], "budget.xlsx", "합계: 100", "합계: 120", confirmed=True)
+    changed = document.read_bytes()
+    assert changed != original
+    assert result["extension"] == ".xlsx"
+    assert result["changed_part"] == "xl/worksheets/sheet1.xml"
+    assert (approved / result["backup_relative_path"]).read_bytes() == original
+    with zipfile.ZipFile(io.BytesIO(changed), "r") as archive:
+        assert archive.testzip() is None
+        xml = archive.read("xl/worksheets/sheet1.xml")
+        ElementTree.fromstring(xml)
+        assert "합계: 120" in xml.decode("utf-8")
