@@ -16,6 +16,7 @@ from engine import (
     BACKUP_DIR,
     CHECKPOINT_PATH,
     CONFIG_PATH,
+    MAX_CONFIG_FILE_BYTES,
     HISTORY_PATH,
     DEBUG_DIR,
     ERROR_DIR,
@@ -1551,11 +1552,14 @@ class AutoWorkAgent(tk.Tk):
         config_file_invalid = False
         try:
             if CONFIG_PATH.exists():
-                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-                else:
+                if CONFIG_PATH.stat().st_size > MAX_CONFIG_FILE_BYTES:
                     config_file_invalid = True
+                else:
+                    loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                    else:
+                        config_file_invalid = True
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             config_file_invalid = True
         self._config_data, reset_fields = validate_runtime_config(data, defaults)
