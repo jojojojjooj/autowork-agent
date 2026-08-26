@@ -60,8 +60,13 @@ def get_policy_profile(name: str | None) -> dict[str, Any]:
 
 def validate_plan_policy(plan: dict[str, Any], profile_name: str | None = None) -> tuple[bool, str]:
     """Apply an explicit profile policy without performing any operating-system action."""
+    if not isinstance(plan, dict):
+        return False, "계획 형식이 올바르지 않습니다. 객체가 필요합니다."
+    raw_steps = plan.get("steps", [])
+    if not isinstance(raw_steps, list):
+        return False, "계획의 steps 형식이 올바르지 않습니다. 배열이 필요합니다."
     policy = get_policy_profile(profile_name)
-    steps = list(plan.get("steps", []))
+    steps = raw_steps
     if len(steps) > policy["max_steps"]:
         return False, f"현재 안전 프로필({policy['label']})에서는 최대 {policy['max_steps']}단계까지만 허용합니다."
     try:

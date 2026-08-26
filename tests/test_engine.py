@@ -484,6 +484,15 @@ def test_error_report_redacts_sensitive_context(tmp_path: Path, monkeypatch):
     assert "redacted" in serialized
 
 
+def test_policy_validation_rejects_malformed_plan_shapes():
+    valid, message = validate_plan_policy(None, "standard")
+    assert valid is False
+    assert "객체" in message
+    valid, message = validate_plan_policy({"steps": "not-a-list"}, "standard")
+    assert valid is False
+    assert "배열" in message
+
+
 def test_ai_plan_rejects_unknown_element():
     valid, message = validate_ai_steps(
         {"steps": [{"action": "click", "element_id": "uia_missing", "confidence": 0.95}]},

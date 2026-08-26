@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import hmac
 import json
 import math
@@ -712,7 +713,7 @@ def clear_execution_checkpoint() -> None:
 def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None, mask_sensitive: bool = True) -> Path:
     """Write a local JSON error report and optionally a screen snapshot."""
     ensure_app_dirs()
-    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns()}"
     report_path = ERROR_DIR / f"error_{stamp}.json"
     report: Dict[str, Any] = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -727,11 +728,13 @@ def write_error_report(context: Dict[str, Any], exc: BaseException, capture_scre
             image = pyautogui.screenshot()
             if mask_sensitive:
                 image = mask_sensitive_image(image)
-            image.save(image_path)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            atomic_write_bytes(image_path, buffer.getvalue())
             report["screen_snapshot"] = str(image_path)
         except Exception as snapshot_exc:
             report["screen_snapshot_error"] = mask_sensitive_text(str(snapshot_exc)[:1000])
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
     append_log(f"오류 보고서 생성: {report_path} · {type(exc).__name__}: {str(exc)[:500]}", "ERROR")
     return report_path
 
