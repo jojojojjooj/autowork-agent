@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from app import engine
-from app.adapters import build_adapter_context, build_document_context, detect_application, normalize_document_roots, normalize_excel_cell_reference, search_approved_documents, validate_pdf_page_number
+from app.adapters import build_adapter_context, build_document_context, build_read_only_adapter_validation, detect_application, normalize_document_roots, normalize_excel_cell_reference, search_approved_documents, validate_pdf_page_number
 from app.policies import review_plan, validate_plan_policy
+from app.release import validate_release_layout
 from app.engine import (
     LocalAIClient,
     LocalScheduler,
@@ -195,6 +196,19 @@ def test_offline_application_adapters():
         normalize_excel_cell_reference("XFE1")
     with pytest.raises(ValueError):
         validate_pdf_page_number(0)
+
+
+def test_read_only_adapter_validation_is_bounded():
+    excel = build_read_only_adapter_validation("Book1 - Excel", "선택 영역 B2:C4, 현재 셀 $D$5")
+    assert excel["application"] == "excel"
+    assert excel["read_only"] is True
+    assert {item["value"] for item in excel["targets"]} >= {"B2:C4", "D5"}
+    assert any("수정하지 않습니다" in item for item in excel["warnings"])
+    pdf = build_read_only_adapter_validation("report.pdf - Acrobat", "페이지 3, page: 4")
+    assert [item["value"] for item in pdf["targets"]] == [3, 4]
+    browser = build_read_only_adapter_validation("Chrome", "로그인 화면")
+    assert browser["targets"] == []
+    assert browser["read_only"] is True
 
 
 def test_approved_local_document_search_is_bounded(tmp_path: Path):
@@ -720,3 +734,17 @@ def test_execution_report_trends_and_user_initiated_export(tmp_path: Path, monke
     assert "steps" not in json.dumps(exported, ensure_ascii=False)
     with pytest.raises(ValueError):
         export_execution_report_summary(tmp_path / "bad.json", period_days=0)
+
+
+def test_windows_release_layout_check():
+    result = validate_release_layout(Path(__file__).resolve().parents[1])
+    assert result["valid"] is True
+    assert result["failed_checks"] == []
+    assert "Windows 실행·설치·빌드를 직접 수행하지 않았습니다" in result["notice"]
+
+
+def test_windows_release_layout_rejects_missing_files(tmp_path: Path):
+    result = validate_release_layout(tmp_path)
+    assert result["valid"] is False
+    assert "file:README.md" in result["failed_checks"]
+    assert "requirements:fully_pinned" in result["failed_checks"]

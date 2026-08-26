@@ -1304,6 +1304,7 @@ class AutoWorkAgent(tk.Tk):
         obs_display = {
             "현재 창": observation.get("active_window", ""),
             "애플리케이션 맥락": observation.get("application_context", {}),
+            "읽기 전용 어댑터 검증": observation.get("adapter_validation", {}),
             "안전 프로필": observation.get("policy_profile", DEFAULT_POLICY_PROFILE),
             "문서 검색 맥락": observation.get("document_context", {}),
             "화면 크기": observation.get("screen_size", []),

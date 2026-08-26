@@ -69,6 +69,57 @@ def validate_pdf_page_number(page: Any) -> int:
     return value
 
 
+READ_ONLY_ADAPTER_SCHEMA_VERSION = 1
+
+
+def build_read_only_adapter_validation(window_title: str, ocr_text: str) -> dict[str, Any]:
+    """Extract bounded, read-only target hints for supported desktop applications."""
+    application = detect_application(window_title)
+    text = (ocr_text or "")[:12_000]
+    result: dict[str, Any] = {
+        "schema_version": READ_ONLY_ADAPTER_SCHEMA_VERSION,
+        "application": application,
+        "read_only": True,
+        "targets": [],
+        "warnings": [],
+    }
+    if application == "excel":
+        targets: list[dict[str, Any]] = []
+        for match in EXCEL_RANGE_RE.finditer(text):
+            try:
+                start = normalize_excel_cell_reference(f"{match.group(1)}{match.group(2)}")
+                end = normalize_excel_cell_reference(f"{match.group(3)}{match.group(4)}")
+            except ValueError:
+                result["warnings"].append("Excel 범위 단서를 검증하지 못했습니다.")
+                continue
+            targets.append({"type": "range", "value": f"{start}:{end}"})
+        for match in EXCEL_CELL_RE.finditer(text):
+            try:
+                value = normalize_excel_cell_reference(f"{match.group(1)}{match.group(2)}")
+            except ValueError:
+                continue
+            targets.append({"type": "cell", "value": value})
+        unique: dict[tuple[str, str], dict[str, Any]] = {(item["type"], item["value"]): item for item in targets}
+        result["targets"] = list(unique.values())[:100]
+        result["warnings"].append("Excel 대상은 주소 단서만 확인하며 셀을 수정하지 않습니다.")
+    elif application == "pdf":
+        pages: list[int] = []
+        for match in PAGE_RE.finditer(text):
+            try:
+                page = validate_pdf_page_number(match.group(1))
+            except ValueError:
+                continue
+            if page not in pages:
+                pages.append(page)
+        result["targets"] = [{"type": "page", "value": page} for page in pages[:50]]
+        result["warnings"].append("PDF 대상은 페이지 번호 단서만 확인하며 문서를 수정하지 않습니다.")
+    elif application in {"hwp", "browser"}:
+        result["warnings"].append("현재 애플리케이션은 읽기 전용 화면 맥락만 제공하며 자동 수정하지 않습니다.")
+    else:
+        result["warnings"].append("지원되는 전용 대상 단서를 찾지 못했습니다.")
+    return result
+
+
 def build_adapter_context(window_title: str, ocr_text: str) -> dict[str, Any]:
     """Return conservative context hints for the local AI prompt."""
     application = detect_application(window_title)

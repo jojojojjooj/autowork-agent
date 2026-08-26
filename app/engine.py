@@ -1562,16 +1562,18 @@ def capture_observation() -> Dict[str, Any]:
         ocr_text = "OCR을 사용할 수 없습니다. Windows에 Tesseract와 kor+eng 언어 데이터를 설치하면 화면 문자를 읽을 수 있습니다."
 
     try:
-        from adapters import build_adapter_context
+        from adapters import build_adapter_context, build_read_only_adapter_validation
     except ImportError:  # package import path for tests and embedded use
-        from app.adapters import build_adapter_context
+        from app.adapters import build_adapter_context, build_read_only_adapter_validation
     application_context = build_adapter_context(active_window, ocr_text)
+    adapter_validation = build_read_only_adapter_validation(active_window, ocr_text)
 
     return {
         "image_path": str(image_path),
         "screen_size": list(image.size),
         "active_window": active_window,
         "application_context": application_context,
+        "adapter_validation": adapter_validation,
         "ocr_text": ocr_text[:12000],
         "ui_controls": ui_controls,
         "elements": element_records,

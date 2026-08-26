@@ -32,4 +32,6 @@ jobs:
           PYTHONPATH: .
         run: pytest -q
       - name: Compile Python sources
-        run: python -m py_compile app/engine.py app/main.py
+        run: python -m py_compile app/engine.py app/main.py app/adapters.py app/policies.py app/release.py
+      - name: Validate Windows release layout
+        run: python -m app.release .
