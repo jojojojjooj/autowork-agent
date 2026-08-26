@@ -34,6 +34,7 @@ from engine import (
     append_log,
     append_execution_history,
     build_execution_report_dashboard,
+    export_execution_report_summary,
     compare_prompt_templates,
     list_prompt_template_versions,
     write_execution_report,
@@ -340,6 +341,7 @@ class AutoWorkAgent(tk.Tk):
         ttk.Button(top, text="로그 새로고침", command=self._refresh_log_view).pack(side="left")
         ttk.Button(top, text="실행 이력 새로고침", command=self._refresh_history_view).pack(side="left", padx=6)
         ttk.Button(top, text="실행 리포트 새로고침", command=self._refresh_report_view).pack(side="left", padx=6)
+        ttk.Button(top, text="리포트 요약 export", command=self._export_execution_report_summary).pack(side="left", padx=6)
         ttk.Button(top, text="운영 상태 새로고침", command=self._refresh_monitor_view).pack(side="left", padx=6)
         ttk.Button(top, text="지원 패키지 저장", command=self._export_support_bundle).pack(side="left", padx=6)
         ttk.Button(top, text="로그 폴더 열기", command=self._open_log_folder).pack(side="left", padx=6)
@@ -421,13 +423,19 @@ class AutoWorkAgent(tk.Tk):
             success_rate = "-" if summary.get("success_rate") is None else f"{summary['success_rate']:.1f}%"
             failure_patterns = summary.get("failure_patterns", [])
             workflow_patterns = summary.get("workflow_failure_patterns", [])
+            policy_stats = summary.get("policy_stats", [])
+            daily_trend = summary.get("daily_trend", [])[-7:]
             failure_text = ", ".join(f"{item.get('error_type')}({item.get('count')})" for item in failure_patterns) or "없음"
             workflow_text = ", ".join(f"{item.get('workflow')}({item.get('count')})" for item in workflow_patterns) or "없음"
+            policy_text = ", ".join(f"{item.get('policy_profile')}: {item.get('success_rate', '-')}%" for item in policy_stats) or "없음"
+            trend_text = ", ".join(f"{item.get('date')}: {item.get('success_rate', '-')}%" for item in daily_trend) or "없음"
             lines = [
                 f"요약 · 리포트 {summary.get('total_reports', 0)} · 완료 {summary.get('completed_runs', 0)} · "
                 f"실패 {summary.get('failed_runs', 0)} · 중지 {summary.get('stopped_runs', 0)} · 성공률 {success_rate}",
                 f"주요 오류 유형: {failure_text}",
                 f"실패 작업: {workflow_text}",
+                f"정책별 성공률: {policy_text}",
+                f"최근 날짜별 성공률: {trend_text}",
                 "",
                 "최근 리포트(입력값·단계 원문 제외):",
             ]
@@ -470,6 +478,29 @@ class AutoWorkAgent(tk.Tk):
             self.after(30_000, self._monitor_heartbeat)
         except tk.TclError:
             return
+
+    def _export_execution_report_summary(self) -> None:
+        period_days = simpledialog.askinteger(
+            "리포트 기간", "최근 며칠의 리포트를 export할까요?", parent=self, initialvalue=30, minvalue=1, maxvalue=3650,
+        )
+        if period_days is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="실행 리포트 요약 export",
+            initialdir=str(APP_DIR),
+            initialfile=f"execution_report_summary_{period_days}d.json",
+            defaultextension=".json",
+            filetypes=[("AutoWork 실행 리포트 요약", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            summary_path = export_execution_report_summary(Path(path), period_days)
+            append_execution_history("execution_report_summary_exported", self.workflow, period_days=period_days, size_bytes=summary_path.stat().st_size)
+            self._set_status(f"실행 리포트 요약 export 완료 · {summary_path.name}")
+            messagebox.showinfo("리포트 export 완료", f"입력값과 Workflow 단계 원문을 제외한 요약을 저장했습니다.\n\n{summary_path}")
+        except Exception as exc:
+            messagebox.showerror("실행 리포트 export 실패", str(exc))
 
     def _export_support_bundle(self) -> None:
         path = filedialog.asksaveasfilename(

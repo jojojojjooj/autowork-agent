@@ -520,17 +520,12 @@ def read_execution_reports(limit: int = 100) -> List[Dict[str, Any]]:
     return reports
 
 
-def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Summarize terminal run reports and bounded failure patterns without workflow inputs."""
-    items = reports if reports is not None else read_execution_reports(MAX_RUN_REPORTS)
+def _summarize_report_group(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     completed_events = {"playback_completed", "ai_plan_completed", "ai_plan_dry_run_completed"}
     failed_events = [item for item in items if str(item.get("event", "")).endswith("_failed")]
     completed = sum(1 for item in items if item.get("event") in completed_events)
     stopped = sum(1 for item in items if str(item.get("event", "")).endswith("_stopped"))
     terminal_runs = completed + len(failed_events)
-    error_counts = Counter(str(item.get("error_type", "")).strip() for item in failed_events if str(item.get("error_type", "")).strip())
-    workflow_counts = Counter(str(item.get("workflow", "")).strip() for item in failed_events if str(item.get("workflow", "")).strip())
-    mode_counts = Counter(str(item.get("mode", "unknown")) for item in items)
     return {
         "total_reports": len(items),
         "completed_runs": completed,
@@ -538,8 +533,36 @@ def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) 
         "stopped_runs": stopped,
         "terminal_runs": terminal_runs,
         "success_rate": round((completed / terminal_runs) * 100, 1) if terminal_runs else None,
+    }
+
+
+def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Summarize terminal reports, policy/date trends, and bounded failure patterns."""
+    items = reports if reports is not None else read_execution_reports(MAX_RUN_REPORTS)
+    base = _summarize_report_group(items)
+    failed_events = [item for item in items if str(item.get("event", "")).endswith("_failed")]
+    error_counts = Counter(str(item.get("error_type", "")).strip() for item in failed_events if str(item.get("error_type", "")).strip())
+    workflow_counts = Counter(str(item.get("workflow", "")).strip() for item in failed_events if str(item.get("workflow", "")).strip())
+    policy_groups: Dict[str, List[Dict[str, Any]]] = {}
+    date_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        policy = str(item.get("policy_profile", "")).strip() or "unknown"
+        policy_groups.setdefault(policy, []).append(item)
+        created_at = str(item.get("created_at", ""))
+        date_key = created_at[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", created_at[:10]) else "unknown"
+        date_groups.setdefault(date_key, []).append(item)
+    policy_stats = []
+    for policy in sorted(policy_groups):
+        policy_stats.append({"policy_profile": policy, **_summarize_report_group(policy_groups[policy])})
+    daily_trend = []
+    for date_key in sorted(date_groups):
+        daily_trend.append({"date": date_key, **_summarize_report_group(date_groups[date_key])})
+    return {
+        **base,
         "event_counts": dict(Counter(str(item.get("event", "unknown")) for item in items)),
-        "mode_counts": dict(mode_counts),
+        "mode_counts": dict(Counter(str(item.get("mode", "unknown")) for item in items)),
+        "policy_stats": policy_stats,
+        "daily_trend": daily_trend,
         "failure_patterns": [{"error_type": name, "count": count} for name, count in error_counts.most_common(10)],
         "workflow_failure_patterns": [{"workflow": name, "count": count} for name, count in workflow_counts.most_common(10)],
         "last_report_at": items[0].get("created_at") if items else None,
@@ -557,6 +580,46 @@ def build_execution_report_dashboard(limit: int = 20) -> Dict[str, Any]:
         "summary": summarize_execution_reports(reports),
         "recent_reports": reports[:recent_limit],
     }
+
+
+def export_execution_report_summary(target: Path, period_days: int = 30) -> Path:
+    """Export a bounded, user-initiated local report summary without inputs or workflow steps."""
+    try:
+        days = int(period_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("리포트 기간은 1~3650일이어야 합니다.") from exc
+    if not 1 <= days <= 3_650:
+        raise ValueError("리포트 기간은 1~3650일이어야 합니다.")
+    cutoff = time.time() - days * 86_400
+    reports = []
+    for report in read_execution_reports(MAX_RUN_REPORTS):
+        try:
+            created = time.mktime(time.strptime(str(report.get("created_at", "")), "%Y-%m-%d %H:%M:%S"))
+        except (TypeError, ValueError, OverflowError):
+            created = None
+        if created is None or created >= cutoff:
+            reports.append(report)
+    payload = redact_sensitive({
+        "schema_version": 1,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "period_days": days,
+        "summary": summarize_execution_reports(reports),
+        "reports": reports[:MAX_RUN_REPORTS],
+        "note": "이 export에는 입력값, 키 입력, 좌표, 화면 캡처, 전체 Workflow 단계 원문을 포함하지 않습니다.",
+    })
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(encoded) > 2 * 1024 * 1024:
+        raise ValueError("실행 리포트 요약 export가 2MB 제한을 초과했습니다.")
+    destination = Path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(encoded)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
 
 
 def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workflow_signature: str = "", mode: str = "playback", error_type: str = "") -> None:

@@ -18,6 +18,7 @@ from app.engine import (
     backup_workflow,
     build_monitor_snapshot,
     build_execution_report_dashboard,
+    export_execution_report_summary,
     cleanup_workflow_backups,
     evaluate_monitor_alerts,
     export_support_bundle,
@@ -696,3 +697,26 @@ def test_execution_report_dashboard_summarizes_failures_without_sensitive_fields
     dashboard = build_execution_report_dashboard(limit=2)
     assert len(dashboard["recent_reports"]) == 2
     assert dashboard["summary"]["total_reports"] == 4
+
+
+def test_execution_report_trends_and_user_initiated_export(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "RUN_REPORT_DIR", tmp_path / "app" / "run_reports")
+    workflow = Workflow(name="추이 작업", steps=[Step(type="key", value="민감 입력")])
+    write_execution_report("policy-standard", "playback_completed", workflow, policy_profile="standard")
+    write_execution_report("policy-browser", "playback_failed", workflow, mode="ai_plan", error_type="PolicyError", policy_profile="browser")
+    reports = read_execution_reports()
+    summary = summarize_execution_reports(reports)
+    policies = {item["policy_profile"]: item for item in summary["policy_stats"]}
+    assert policies["standard"]["completed_runs"] == 1
+    assert policies["browser"]["failed_runs"] == 1
+    assert len(summary["daily_trend"]) == 1
+    output = tmp_path / "export" / "summary.json"
+    export_execution_report_summary(output, period_days=30)
+    exported = json.loads(output.read_text(encoding="utf-8"))
+    assert exported["period_days"] == 30
+    assert exported["summary"]["total_reports"] == 2
+    assert "민감 입력" not in json.dumps(exported, ensure_ascii=False)
+    assert "steps" not in json.dumps(exported, ensure_ascii=False)
+    with pytest.raises(ValueError):
+        export_execution_report_summary(tmp_path / "bad.json", period_days=0)
