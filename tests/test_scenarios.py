@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import tkinter as tk
 import zipfile
 from html import escape as xml_escape
 from pathlib import Path
@@ -36,6 +37,7 @@ from app.engine import (
     verify_workflow_signature,
     write_execution_report,
 )
+from app.main import AutoWorkAgent
 from app.policies import review_plan
 
 
@@ -352,10 +354,16 @@ def test_scenario_document_path_and_backup_edge_cases(tmp_path: Path):
     outside_document.write_text("상태: 외부", encoding="utf-8")
     linked_document = approved / "linked.md"
     linked_document.symlink_to(outside_document)
+    linked_directory = approved / "linked-directory"
+    linked_directory.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError, match="루트 밖에|symlink"):
         update_approved_text_document(
             [str(approved)], "linked.md", "상태: 외부", "상태: 차단", confirmed=True
+        )
+    with pytest.raises(ValueError, match="symlink"):
+        update_approved_text_document(
+            [str(approved)], "linked-directory/outside.md", "상태: 외부", "상태: 차단", confirmed=True
         )
 
     document = approved / "report[1].md"
@@ -404,3 +412,69 @@ def test_scenario_office_size_guard_and_zip_traversal_are_rejected(tmp_path: Pat
             [str(approved)], "unsafe.docx", "상태: 초안", "상태: 완료", confirmed=True
         )
     assert unsafe.read_bytes() == original
+
+
+def test_scenario_restore_rechecks_current_sha_before_replacing(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "race.md"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+    result = update_approved_text_document(
+        [str(approved)], "race.md", "상태: 초안", "상태: 완료", confirmed=True
+    )
+    original_verify = verify_document_change
+
+    def verify_then_mutate(*args, **kwargs):
+        verified = original_verify(*args, **kwargs)
+        document.write_text("상태: 동시 변경\n", encoding="utf-8")
+        return verified
+
+    monkeypatch.setattr(adapters, "verify_document_change", verify_then_mutate)
+    with pytest.raises(ValueError, match="복구 직전"):
+        restore_document_backup(
+            [str(approved)],
+            "race.md",
+            result["after_sha256"],
+            result["before_sha256"],
+            confirmed=True,
+        )
+    assert document.read_text(encoding="utf-8") == "상태: 동시 변경\n"
+
+
+def test_gui_queue_ignores_shutdown_races():
+    agent = object.__new__(AutoWorkAgent)
+
+    for error in (RuntimeError("main loop stopped"), tk.TclError("application has been destroyed")):
+        def raising_after(_delay, _callback, failure=error):
+            raise failure
+
+        agent.after = raising_after
+        AutoWorkAgent._queue_ui(agent, lambda: None)
+
+
+def test_scenario_restore_rejects_backup_changed_after_verification(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "backup-race.md"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+    result = update_approved_text_document(
+        [str(approved)], "backup-race.md", "상태: 초안", "상태: 완료", confirmed=True
+    )
+    backup = approved / result["backup_relative_path"]
+    original_verify = verify_document_change
+
+    def verify_then_tamper(*args, **kwargs):
+        verified = original_verify(*args, **kwargs)
+        backup.write_text("변조된 백업\n", encoding="utf-8")
+        return verified
+
+    monkeypatch.setattr(adapters, "verify_document_change", verify_then_tamper)
+    with pytest.raises(ValueError, match="백업이 변경"):
+        restore_document_backup(
+            [str(approved)],
+            "backup-race.md",
+            result["after_sha256"],
+            result["before_sha256"],
+            confirmed=True,
+        )
+    assert document.read_text(encoding="utf-8") == "상태: 완료\n"

@@ -66,6 +66,10 @@ MAX_STEP_DELAY = 60.0
 MAX_CAPTURE_AGE_DAYS = 30
 MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
 MAX_CONFIG_FILE_BYTES = 256 * 1024
+MAX_AI_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_AI_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
+MAX_LOG_RECORDS_ON_ROTATE = 1_000
 AUDIT_HASH_VERSION = 1
 AUDIT_GENESIS = "0" * 64
 MAX_WORKFLOW_BACKUPS = 20
@@ -170,12 +174,21 @@ def mask_sensitive_image(image: Any) -> Any:
 
 
 def append_log(message: str, level: str = "INFO") -> None:
-    """Append a local diagnostic line without sending data anywhere."""
-    ensure_app_dirs()
-    safe_message = mask_sensitive_text(str(redact_sensitive(message)))
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {safe_message}\n"
-    with _LOG_LOCK, LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(line)
+    """Append a bounded local diagnostic line without sending data anywhere."""
+    try:
+        ensure_app_dirs()
+        safe_message = mask_sensitive_text(str(redact_sensitive(message)))
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {safe_message}\n"
+        with _LOG_LOCK:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size >= MAX_LOG_FILE_BYTES:
+                previous = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+                kept = previous[-MAX_LOG_RECORDS_ON_ROTATE:]
+                atomic_write_text(LOG_PATH, "\n".join(kept) + ("\n" if kept else ""))
+            with LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+    except OSError:
+        # Diagnostics must not crash the operation they are reporting.
+        return
 
 
 def _audit_hash(record: dict[str, Any]) -> str:
@@ -1727,8 +1740,14 @@ class LocalAIClient:
         import requests
 
         try:
-            response = requests.get(f"{self.endpoint}/models", timeout=min(self.timeout, 5))
+            response = requests.get(
+                f"{self.endpoint}/models",
+                timeout=min(self.timeout, 5),
+                allow_redirects=False,
+            )
+            self._reject_redirect(response)
             response.raise_for_status()
+            self._ensure_bounded_response(response)
             payload = response.json()
             models = payload.get("data", []) if isinstance(payload, dict) else []
             model_names = [str(item.get("id", "")) for item in models if isinstance(item, dict) and item.get("id")]
@@ -1740,9 +1759,28 @@ class LocalAIClient:
 
     @staticmethod
     def _image_data_url(path: str) -> str:
-        raw = Path(path).read_bytes()
+        image_path = Path(path).expanduser()
+        if image_path.suffix.casefold() != ".png" or image_path.is_symlink() or not image_path.is_file():
+            raise ValueError("비전 입력은 기존 PNG 파일만 사용할 수 있습니다.")
+        try:
+            if image_path.stat().st_size > MAX_AI_IMAGE_BYTES:
+                raise ValueError("비전 입력 이미지가 허용 크기를 초과합니다.")
+            raw = image_path.read_bytes()
+        except OSError as exc:
+            raise ValueError("비전 입력 이미지를 읽을 수 없습니다.") from exc
         encoded = base64.b64encode(raw).decode("ascii")
         return f"data:image/png;base64,{encoded}"
+
+    @staticmethod
+    def _reject_redirect(response: Any) -> None:
+        if 300 <= int(getattr(response, "status_code", 0)) < 400:
+            raise RuntimeError("로컬 AI 서버가 redirect를 반환했습니다.")
+
+    @staticmethod
+    def _ensure_bounded_response(response: Any) -> None:
+        content = getattr(response, "content", b"")
+        if isinstance(content, (bytes, bytearray)) and len(content) > MAX_AI_RESPONSE_BYTES:
+            raise RuntimeError("로컬 AI 서버 응답이 허용 크기를 초과합니다.")
 
     @staticmethod
     def _extract_content(response: dict[str, Any]) -> str:
@@ -1837,16 +1875,32 @@ class LocalAIClient:
             },
         }
         try:
-            response = requests.post(f"{self.endpoint}/chat/completions", json=payload, timeout=self.timeout)
+            response = requests.post(
+                f"{self.endpoint}/chat/completions",
+                json=payload,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+            self._reject_redirect(response)
             if response.status_code == 400:
                 # 일부 로컬 서버는 response_format을 아직 지원하지 않으므로 한 번만 호환 모드로 재시도합니다.
                 payload.pop("response_format", None)
-                response = requests.post(f"{self.endpoint}/chat/completions", json=payload, timeout=self.timeout)
+                response = requests.post(
+                    f"{self.endpoint}/chat/completions",
+                    json=payload,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+                self._reject_redirect(response)
             response.raise_for_status()
+            self._ensure_bounded_response(response)
         except requests.RequestException as exc:
             detail = getattr(getattr(exc, "response", None), "text", "")[:500]
             raise RuntimeError(f"로컬 AI 요청에 실패했습니다: {exc}{(' · ' + detail) if detail else ''}") from exc
-        raw = self._parse_json(self._extract_content(response.json()))
+        try:
+            raw = self._parse_json(self._extract_content(response.json()))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("로컬 AI 서버 응답 형식이 올바르지 않습니다.") from exc
         try:
             return AutomationPlan.model_validate(raw).model_dump(mode="json")
         except ValidationError as exc:
@@ -1987,9 +2041,9 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
 def load_prompt_template(path: Path) -> dict[str, Any]:
     """Load and validate a natural-language task template."""
     target = Path(path)
-    if target.stat().st_size > 256 * 1024:
-        raise ValueError("자연어 템플릿 파일이 너무 큽니다.")
     try:
+        if target.stat().st_size > 256 * 1024:
+            raise ValueError("자연어 템플릿 파일이 너무 큽니다.")
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"자연어 템플릿을 읽을 수 없습니다: {exc}") from exc
@@ -2092,9 +2146,9 @@ def render_prompt_template(template: str, values: dict[str, Any]) -> str:
 
 def load_workflow(path: Path, require_signature: bool = False) -> Workflow:
     path = Path(path)
-    if path.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
-        raise ValueError("작업 파일이 너무 큽니다.")
     try:
+        if path.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
+            raise ValueError("작업 파일이 너무 큽니다.")
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"작업 파일을 읽을 수 없습니다: {exc}") from exc

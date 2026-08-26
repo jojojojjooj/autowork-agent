@@ -564,15 +564,15 @@ def test_local_ai_health_check_reads_models_only(monkeypatch):
         def json(self):
             return {"data": [{"id": "local-model"}]}
 
-    def fake_get(url, timeout):
-        calls.append((url, timeout))
+    def fake_get(url, timeout, allow_redirects):
+        calls.append((url, timeout, allow_redirects))
         return FakeResponse()
 
     monkeypatch.setattr(requests, "get", fake_get)
     result = LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model", timeout=120).health_check()
     assert result["reachable"] is True
     assert result["models"] == ["local-model"]
-    assert calls == [("http://127.0.0.1:11434/v1/models", 5)]
+    assert calls == [("http://127.0.0.1:11434/v1/models", 5, False)]
 
 
 def test_workflow_is_saved_as_version_2_and_rejects_unsafe_steps(tmp_path: Path):
@@ -897,3 +897,129 @@ def test_workflow_from_dict_reports_type_errors_for_wrong_container_types():
         Workflow.from_dict({"version": 2, "steps": {}})
     with pytest.raises(TypeError, match="이름"):
         Workflow.from_dict({"version": 2, "name": 123, "steps": []})
+
+
+def test_local_ai_health_check_rejects_redirect(monkeypatch):
+    import requests
+
+    class RedirectResponse:
+        status_code = 302
+
+        def raise_for_status(self):
+            return None
+
+    calls = []
+
+    def fake_get(url, timeout, allow_redirects):
+        calls.append((url, timeout, allow_redirects))
+        return RedirectResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with pytest.raises(RuntimeError, match="redirect"):
+        LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model").health_check()
+    assert calls == [("http://127.0.0.1:11434/v1/models", 5, False)]
+
+
+def test_local_ai_image_data_url_requires_bounded_png(tmp_path: Path, monkeypatch):
+    image = tmp_path / "screen.png"
+    image.write_bytes(b"\x89PNG\r\n")
+    encoded = LocalAIClient._image_data_url(str(image))
+    assert encoded.startswith("data:image/png;base64,")
+
+    text_file = tmp_path / "screen.txt"
+    text_file.write_text("not an image", encoding="utf-8")
+    with pytest.raises(ValueError, match="PNG"):
+        LocalAIClient._image_data_url(str(text_file))
+
+    monkeypatch.setattr(engine, "MAX_AI_IMAGE_BYTES", 1)
+    with pytest.raises(ValueError, match="허용 크기"):
+        LocalAIClient._image_data_url(str(image))
+
+
+def test_local_ai_response_size_is_bounded(monkeypatch):
+    class LargeResponse:
+        content = b"x" * 32
+
+    monkeypatch.setattr(engine, "MAX_AI_RESPONSE_BYTES", 16)
+    with pytest.raises(RuntimeError, match="응답이 허용 크기"):
+        LocalAIClient._ensure_bounded_response(LargeResponse())
+
+
+def test_local_ai_make_plan_validates_response_and_disables_redirects(monkeypatch):
+    import requests
+
+    payloads = []
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"choices": []}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": json.dumps({"summary": "ok", "risk": "low", "steps": []})}}]}
+
+    def fake_post(url, json, timeout, allow_redirects):
+        payloads.append((url, json, timeout, allow_redirects))
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    plan = LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model", timeout=12).make_plan(
+        "상태 확인", {"elements": [], "screen_size": [1920, 1080]}
+    )
+    assert plan["summary"] == "ok"
+    assert payloads[0][0].endswith("/chat/completions")
+    assert payloads[0][2:] == (12, False)
+    assert "response_format" in payloads[0][1]
+
+
+def test_local_ai_make_plan_retries_400_without_response_format(monkeypatch):
+    import requests
+
+    payloads = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.content = b"{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"summary":"ok","risk":"low","steps":[]}'}}]}
+
+    def fake_post(url, json, timeout, allow_redirects):
+        payloads.append(json.copy())
+        return FakeResponse(400 if len(payloads) == 1 else 200)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    plan = LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model").make_plan("상태 확인", {})
+    assert plan["risk"] == "low"
+    assert "response_format" in payloads[0]
+    assert "response_format" not in payloads[1]
+
+
+def test_append_log_rotates_bounded_history(tmp_path: Path, monkeypatch):
+    log_path = tmp_path / "app" / "autowork.log"
+    log_path.parent.mkdir()
+    log_path.write_text("old-1\nold-2\nold-3\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(engine, "LOG_PATH", log_path)
+    monkeypatch.setattr(engine, "MAX_LOG_FILE_BYTES", 1)
+    monkeypatch.setattr(engine, "MAX_LOG_RECORDS_ON_ROTATE", 2)
+
+    engine.append_log("new-entry")
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines[-1].endswith("new-entry")
+    assert "old-1" not in lines
+    assert "old-2" in lines
+    assert "old-3" in lines
+
+
+def test_load_missing_persistence_files_fail_closed(tmp_path: Path):
+    with pytest.raises(ValueError, match="자연어 템플릿을 읽을 수 없습니다"):
+        load_prompt_template(tmp_path / "missing-template.json")
+    with pytest.raises(ValueError, match="작업 파일을 읽을 수 없습니다"):
+        load_workflow(tmp_path / "missing-workflow.json")

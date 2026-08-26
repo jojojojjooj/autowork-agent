@@ -7,64 +7,123 @@ import threading
 import time
 import tkinter as tk
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
-from engine import (
-    APP_DIR,
-    BACKUP_DIR,
-    CONFIG_PATH,
-    ERROR_DIR,
-    LOG_PATH,
-    TEMPLATE_DIR,
-    WORKFLOW_DIR,
-    InputRecorder,
-    LocalAIClient,
-    LocalScheduler,
-    RetryableAutomationError,
-    Step,
-    UserInterventionRequired,
-    Workflow,
-    WorkflowPlayer,
-    append_execution_history,
-    append_log,
-    atomic_write_text,
-    build_execution_report_dashboard,
-    build_monitor_snapshot,
-    capture_observation,
-    cleanup_expired_artifacts,
-    clear_execution_checkpoint,
-    compare_prompt_templates,
-    ensure_app_dirs,
-    evaluate_scheduler_health,
-    export_execution_report_summary,
-    export_support_bundle,
-    get_screen_size,
-    inspect_workflow,
-    list_prompt_template_versions,
-    load_execution_checkpoint,
-    load_prompt_template,
-    load_runtime_config,
-    load_workflow,
-    read_execution_history,
-    redact_sensitive,
-    render_prompt_template,
-    save_execution_checkpoint,
-    save_prompt_template,
-    save_workflow,
-    summarize_execution_history,
-    validate_ai_steps,
-    validate_local_endpoint,
-    validate_schedule_interval,
-    validate_timeout,
-    validate_workflow,
-    verify_execution_history,
-    verify_workflow_signature,
-    write_error_report,
-    write_execution_report,
-    write_monitor_snapshot,
-)
+try:
+    from engine import (
+        APP_DIR,
+        BACKUP_DIR,
+        CONFIG_PATH,
+        ERROR_DIR,
+        LOG_PATH,
+        TEMPLATE_DIR,
+        WORKFLOW_DIR,
+        InputRecorder,
+        LocalAIClient,
+        LocalScheduler,
+        RetryableAutomationError,
+        Step,
+        UserInterventionRequired,
+        Workflow,
+        WorkflowPlayer,
+        append_execution_history,
+        append_log,
+        atomic_write_text,
+        build_execution_report_dashboard,
+        build_monitor_snapshot,
+        capture_observation,
+        cleanup_expired_artifacts,
+        clear_execution_checkpoint,
+        compare_prompt_templates,
+        ensure_app_dirs,
+        evaluate_scheduler_health,
+        export_execution_report_summary,
+        export_support_bundle,
+        get_screen_size,
+        inspect_workflow,
+        list_prompt_template_versions,
+        load_execution_checkpoint,
+        load_prompt_template,
+        load_runtime_config,
+        load_workflow,
+        read_execution_history,
+        redact_sensitive,
+        render_prompt_template,
+        save_execution_checkpoint,
+        save_prompt_template,
+        save_workflow,
+        summarize_execution_history,
+        validate_ai_steps,
+        validate_local_endpoint,
+        validate_schedule_interval,
+        validate_timeout,
+        validate_workflow,
+        verify_execution_history,
+        verify_workflow_signature,
+        write_error_report,
+        write_execution_report,
+        write_monitor_snapshot,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "engine":
+        raise
+    from app.engine import (
+        APP_DIR,
+        BACKUP_DIR,
+        CONFIG_PATH,
+        ERROR_DIR,
+        LOG_PATH,
+        TEMPLATE_DIR,
+        WORKFLOW_DIR,
+        InputRecorder,
+        LocalAIClient,
+        LocalScheduler,
+        RetryableAutomationError,
+        Step,
+        UserInterventionRequired,
+        Workflow,
+        WorkflowPlayer,
+        append_execution_history,
+        append_log,
+        atomic_write_text,
+        build_execution_report_dashboard,
+        build_monitor_snapshot,
+        capture_observation,
+        cleanup_expired_artifacts,
+        clear_execution_checkpoint,
+        compare_prompt_templates,
+        ensure_app_dirs,
+        evaluate_scheduler_health,
+        export_execution_report_summary,
+        export_support_bundle,
+        get_screen_size,
+        inspect_workflow,
+        list_prompt_template_versions,
+        load_execution_checkpoint,
+        load_prompt_template,
+        load_runtime_config,
+        load_workflow,
+        read_execution_history,
+        redact_sensitive,
+        render_prompt_template,
+        save_execution_checkpoint,
+        save_prompt_template,
+        save_workflow,
+        summarize_execution_history,
+        validate_ai_steps,
+        validate_local_endpoint,
+        validate_schedule_interval,
+        validate_timeout,
+        validate_workflow,
+        verify_execution_history,
+        verify_workflow_signature,
+        write_error_report,
+        write_execution_report,
+        write_monitor_snapshot,
+    )
 
 try:
     from adapters import build_document_context, normalize_document_roots
@@ -554,7 +613,7 @@ class AutoWorkAgent(tk.Tk):
         if report_path:
             status += f" · {report_path.name}"
         self._set_status(status)
-        self.after(0, self._refresh_log_view)
+        self._queue_ui(self._refresh_log_view)
         return report_path
 
     def _show_exception_dialog(self, component: str, exc: BaseException, report_path: Path | None) -> None:
@@ -563,21 +622,21 @@ class AutoWorkAgent(tk.Tk):
 
     def _on_recorder_error(self, exc: BaseException) -> None:
         report_path = self._handle_exception("입력 기록", exc)
-        self.after(0, lambda: self._show_exception_dialog("입력 기록", exc, report_path))
-        self.after(0, self._stop_recording)
+        self._queue_ui(lambda: self._show_exception_dialog("입력 기록", exc, report_path))
+        self._queue_ui(self._stop_recording)
 
     def _on_player_error(self, exc: BaseException, index: int, step: Step) -> None:
         self.last_failed_step_index = max(0, index - 1)
         if hasattr(self, "resume_play_button"):
-            self.after(0, lambda: self.resume_play_button.configure(state="normal"))
+            self._queue_ui(lambda: self.resume_play_button.configure(state="normal"))
         failure_context = {"failed_step": index, "step": redact_sensitive(step.__dict__), "error_type": type(exc).__name__, "error": str(exc)[:1200]}
         save_execution_checkpoint(self.current_path, index - 1, self.workflow.signature or "", error_type=type(exc).__name__)
         self._pending_checkpoint = load_execution_checkpoint()
         if hasattr(self, "recover_checkpoint_button"):
-            self.after(0, lambda: self.recover_checkpoint_button.configure(state="normal"))
+            self._queue_ui(lambda: self.recover_checkpoint_button.configure(state="normal"))
         report_path = self._handle_exception("작업 재생", exc, failure_context)
-        self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
-        self.after(0, lambda: self._offer_recovery_plan(failure_context))
+        self._queue_ui(lambda: self._show_exception_dialog("작업 재생", exc, report_path))
+        self._queue_ui(lambda: self._offer_recovery_plan(failure_context))
 
     def _offer_recovery_plan(self, failure_context: dict[str, Any]) -> None:
         if not messagebox.askyesno("AI 복구 분석", "실패한 화면을 다시 관찰해 복구 계획을 제안할까요?\n\n복구안은 자동 실행되지 않으며 사용자가 검토해야 합니다."):
@@ -613,11 +672,11 @@ class AutoWorkAgent(tk.Tk):
                 raise ValueError("모델 이름을 입력하세요.")
             client = LocalAIClient(settings["endpoint"], settings["model"], settings["timeout"], settings["vision"])
             plan = client.make_recovery_plan(failure_context, observation)
-            self.after(0, lambda: self._show_ai_result(observation, plan))
-            self.after(0, lambda: self._set_status("복구 계획 생성 완료 · 검토 후 실행 가능"))
+            self._queue_ui(lambda: self._show_ai_result(observation, plan))
+            self._queue_ui(lambda: self._set_status("복구 계획 생성 완료 · 검토 후 실행 가능"))
         except Exception as exc:  # noqa: BLE001
             report_path = self._handle_exception("복구 계획 생성", exc, {"failure": failure_context})
-            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("복구 계획 생성", error, path))
+            self._queue_ui(lambda error=exc, path=report_path: self._show_exception_dialog("복구 계획 생성", error, path))
         finally:
             self.ai_running = False
             self._ai_job_lock.release()
@@ -640,9 +699,9 @@ class AutoWorkAgent(tk.Tk):
     def _emergency_stop(self) -> None:
         self.player.stop()
         self.ai_stop_event.set()
-        self.after(0, self._stop_recording)
+        self._queue_ui(self._stop_recording)
         if hasattr(self, "stop_ai_button"):
-            self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
+            self._queue_ui(lambda: self.stop_ai_button.configure(state="disabled"))
         self._set_status("긴급 중지 요청 · 재생 및 AI 실행 중단")
 
     def _current_policy_profile(self) -> str:
@@ -654,15 +713,22 @@ class AutoWorkAgent(tk.Tk):
         self.capture_on_error_enabled = bool(self.capture_on_error_var.get()) if hasattr(self, "capture_on_error_var") else self.capture_on_error_enabled
         self._save_config()
 
+    def _queue_ui(self, callback: Callable[[], None], delay_ms: int = 0) -> None:
+        """Queue a UI callback while tolerating shutdown races from worker threads."""
+        try:
+            self.after(delay_ms, callback)
+        except (RuntimeError, tk.TclError):
+            return
+
     def _set_status(self, text: str) -> None:
         def update() -> None:
             self.status_var.set(text)
             if hasattr(self, "last_action_var"):
                 self.last_action_var.set(f"최근 상태: {text}")
-        self.after(0, update)
+        self._queue_ui(update)
 
     def _on_recorded_step(self, step: Step) -> None:
-        self.after(0, lambda: self._append_step_row(step))
+        self._queue_ui(lambda: self._append_step_row(step))
 
     def _append_step_row(self, step: Step) -> None:
         index = len(self.workflow.steps) + 1
@@ -902,10 +968,10 @@ class AutoWorkAgent(tk.Tk):
         self._set_status("AI 실행 중지 요청")
 
     def _on_play_step(self, index: int, step: Step) -> None:
-        self.after(0, lambda: self.step_tree.selection_set(self.step_tree.get_children()[index - 1]))
+        self._queue_ui(lambda: self.step_tree.selection_set(self.step_tree.get_children()[index - 1]))
         if self.step_mode_enabled:
             self._step_gate.clear()
-            self.after(0, lambda: self._show_step_confirmation(index, step))
+            self._queue_ui(lambda: self._show_step_confirmation(index, step))
             if not self._step_gate.wait(timeout=300):
                 self.player.stop()
 
@@ -1051,8 +1117,8 @@ class AutoWorkAgent(tk.Tk):
                 clear_execution_checkpoint()
                 self._pending_checkpoint = None
                 self.last_failed_step_index = None
-                self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
-                self.after(0, lambda: self.recover_checkpoint_button.configure(state="disabled"))
+                self._queue_ui(lambda: self.resume_play_button.configure(state="disabled"))
+                self._queue_ui(lambda: self.recover_checkpoint_button.configure(state="disabled"))
         except Exception as exc:  # noqa: BLE001
             duration = round(time.monotonic() - started_at, 3)
             report_path = write_execution_report(
@@ -1066,13 +1132,13 @@ class AutoWorkAgent(tk.Tk):
             save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
             self._pending_checkpoint = load_execution_checkpoint()
             report_path = self._handle_exception("작업 재생", exc)
-            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("작업 재생", error, path))
+            self._queue_ui(lambda error=exc, path=report_path: self._show_exception_dialog("작업 재생", error, path))
         finally:
             self._step_gate.set()
             self.step_mode_enabled = False
             self._playback_launch_lock.release()
-            self.after(0, lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
-            self.after(0, self._refresh_history_view)
+            self._queue_ui(lambda: self.pause_play_button.configure(state="disabled", text="재생 일시정지"))
+            self._queue_ui(self._refresh_history_view)
 
     def _save_workflow(self) -> None:
         self.workflow.name = self.workflow_name_var.get().strip() or "새 작업"
@@ -1282,10 +1348,10 @@ class AutoWorkAgent(tk.Tk):
                 vision=bool(settings["vision"]),
             )
             plan = client.make_plan(goal, observation)
-            self.after(0, lambda: self._show_ai_result(observation, plan))
+            self._queue_ui(lambda: self._show_ai_result(observation, plan))
         except Exception as exc:  # noqa: BLE001
             report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal), "policy_profile": settings.get("policy_profile", DEFAULT_POLICY_PROFILE)})
-            self.after(0, lambda error=exc, path=report_path: self._agent_failed(error, path))
+            self._queue_ui(lambda error=exc, path=report_path: self._agent_failed(error, path))
         finally:
             self.ai_running = False
             self._ai_job_lock.release()
@@ -1530,7 +1596,7 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             run_error_type = type(exc).__name__
             report_path = self._handle_exception("AI 계획 실행", exc, {"failed_step": self.last_ai_index, "step": failed_step})
-            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("AI 계획 실행", error, path))
+            self._queue_ui(lambda error=exc, path=report_path: self._show_exception_dialog("AI 계획 실행", error, path))
         finally:
             duration = round(time.monotonic() - started_at, 3)
             run_id = self.last_ai_run_id or secrets.token_hex(8)
@@ -1548,9 +1614,9 @@ class AutoWorkAgent(tk.Tk):
             )
             self.ai_running = False
             self._ai_job_lock.release()
-            self.after(0, lambda: self.execute_plan_button.configure(state="normal"))
-            self.after(0, self._refresh_history_view)
-            self.after(0, lambda: self.stop_ai_button.configure(state="disabled"))
+            self._queue_ui(lambda: self.execute_plan_button.configure(state="normal"))
+            self._queue_ui(self._refresh_history_view)
+            self._queue_ui(lambda: self.stop_ai_button.configure(state="disabled"))
 
     def _load_config(self) -> None:
         defaults = {"endpoint": "http://127.0.0.1:11434/v1", "model": "gemma4:e2b", "timeout": 120, "vision": False, "capture_on_error": True, "dry_run": True, "schedule_interval": 3600, "policy_profile": DEFAULT_POLICY_PROFILE, "document_roots": []}
@@ -1600,9 +1666,9 @@ class AutoWorkAgent(tk.Tk):
     def _check_ai_connection_worker(self, client: LocalAIClient) -> None:
         try:
             result = client.health_check()
-            self.after(0, lambda: self._show_ai_connection_result(client.model, result))
+            self._queue_ui(lambda: self._show_ai_connection_result(client.model, result))
         except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda error=exc: self._show_ai_connection_error(error))
+            self._queue_ui(lambda error=exc: self._show_ai_connection_error(error))
 
     def _show_ai_connection_result(self, model: str, result: dict[str, Any]) -> None:
         models = result.get("models", [])
@@ -1658,7 +1724,7 @@ class AutoWorkAgent(tk.Tk):
     def _scheduled_run(self) -> None:
         """Queue a scheduled playback check on Tk's main thread."""
         try:
-            self.after(0, self._launch_scheduled_playback)
+            self._queue_ui(self._launch_scheduled_playback)
         except tk.TclError:
             return
 

@@ -189,6 +189,23 @@ def normalize_document_roots(roots: Iterable[str] | str | None) -> list[Path]:
     return resolved
 
 
+def _contains_symlink(root: Path, candidate: Path) -> bool:
+    """Return whether any existing component from root to candidate is a symlink."""
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def update_approved_text_document(
     roots: Iterable[str] | str | None,
     relative_path: str,
@@ -213,12 +230,14 @@ def update_approved_text_document(
     if not raw_relative or Path(raw_relative).is_absolute():
         raise ValueError("문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
     candidate = root / Path(raw_relative)
+    if _contains_symlink(root, candidate):
+        raise ValueError("변경 대상 문서가 symlink입니다.")
     try:
         resolved = candidate.resolve()
         resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError("문서 경로가 승인된 루트 밖에 있습니다.") from exc
-    if resolved.is_symlink() or not resolved.is_file():
+    if _contains_symlink(root, resolved) or not resolved.is_file():
         raise ValueError("변경 대상 문서가 없거나 symlink입니다.")
     if resolved.suffix.casefold() not in TEXT_MUTATION_SUFFIXES:
         raise ValueError("변경은 승인된 텍스트 문서 확장자만 지원합니다.")
@@ -274,6 +293,8 @@ def update_approved_office_document(
     if not raw_relative or Path(raw_relative).is_absolute():
         raise ValueError("Office 문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
     candidate = root / Path(raw_relative)
+    if _contains_symlink(root, candidate):
+        raise ValueError("변경 대상 문서가 symlink입니다.")
     try:
         resolved = candidate.resolve()
         resolved.relative_to(root)
@@ -282,7 +303,7 @@ def update_approved_office_document(
     suffix = resolved.suffix.casefold()
     if suffix not in OFFICE_MUTATION_SUFFIXES:
         raise ValueError("Office 문서 변경은 .docx 또는 .xlsx만 지원합니다.")
-    if resolved.is_symlink() or not resolved.is_file():
+    if _contains_symlink(root, resolved) or not resolved.is_file():
         raise ValueError("변경 대상 Office 문서가 없거나 symlink입니다.")
     try:
         original = resolved.read_bytes()
@@ -373,11 +394,14 @@ def verify_document_change(
     if not raw_relative or Path(raw_relative).is_absolute():
         raise ValueError("문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
     try:
-        resolved = (root / Path(raw_relative)).resolve()
+        candidate = root / Path(raw_relative)
+        if _contains_symlink(root, candidate):
+            raise ValueError("검증 대상 문서가 symlink입니다.")
+        resolved = candidate.resolve()
         resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError("문서 경로가 승인된 루트 밖에 있습니다.") from exc
-    if resolved.is_symlink() or not resolved.is_file():
+    if _contains_symlink(root, resolved) or not resolved.is_file():
         raise ValueError("검증 대상 문서가 없거나 symlink입니다.")
     try:
         size_limit = MAX_OFFICE_PACKAGE_BYTES if resolved.suffix.casefold() in OFFICE_MUTATION_SUFFIXES else MAX_DOCUMENT_BYTES
@@ -400,21 +424,28 @@ def verify_document_change(
         backup_expected = str(expected_backup_sha256).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", backup_expected):
             raise ValueError("예상 백업 SHA-256 값이 올바르지 않습니다.")
-        candidates = sorted(
-            (
-                item
-                for item in resolved.parent.iterdir()
-                if item.name.startswith(f".{resolved.name}.autowork-") and item.name.endswith(".bak")
-            ),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
+        candidates: list[tuple[Path, float]] = []
+        try:
+            items = resolved.parent.iterdir()
+            for item in items:
+                if not item.name.startswith(f".{resolved.name}.autowork-") or not item.name.endswith(".bak"):
+                    continue
+                try:
+                    candidates.append((item, item.stat().st_mtime))
+                except OSError:
+                    continue
+        except OSError as exc:
+            raise ValueError("문서 변경 백업을 열거할 수 없습니다.") from exc
+        candidates.sort(key=lambda pair: pair[1], reverse=True)
         backup = None
         backup_actual = ""
-        for candidate in candidates:
-            if not candidate.is_file() or candidate.is_symlink():
+        for candidate, _mtime in candidates:
+            try:
+                if not candidate.is_file() or candidate.is_symlink():
+                    continue
+                candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            except OSError:
                 continue
-            candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
             if candidate_hash == backup_expected:
                 backup = candidate
                 backup_actual = candidate_hash
@@ -446,7 +477,21 @@ def restore_document_backup(
     resolved = (root / Path(relative_path)).resolve()
     backup = root / Path(verification["backup_relative_path"])
     try:
-        atomic_write_bytes(resolved, backup.read_bytes())
+        current_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise OSError(f"복구 전 현재 문서를 읽을 수 없습니다: {exc}") from exc
+    if current_hash != str(expected_current_sha256 or "").strip().lower():
+        raise ValueError("복구 직전 문서가 변경되어 복구를 중단했습니다.")
+    if _contains_symlink(root, backup) or not backup.is_file():
+        raise ValueError("복구 백업이 없거나 symlink입니다.")
+    try:
+        backup_bytes = backup.read_bytes()
+    except OSError as exc:
+        raise OSError(f"복구 백업을 읽을 수 없습니다: {exc}") from exc
+    if hashlib.sha256(backup_bytes).hexdigest() != backup_expected:
+        raise ValueError("복구 직전 백업이 변경되어 복구를 중단했습니다.")
+    try:
+        atomic_write_bytes(resolved, backup_bytes)
     except OSError as exc:
         raise OSError(f"문서 백업을 원자적으로 복구하지 못했습니다: {exc}") from exc
     restored_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
