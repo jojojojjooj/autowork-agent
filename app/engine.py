@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -23,9 +24,12 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-try:
-    import pyautogui
-except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
+if sys.platform == "win32":
+    try:
+        import pyautogui
+    except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
+        pyautogui = None
+else:
     pyautogui = None
 
 try:
@@ -33,9 +37,13 @@ try:
 except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
     pyperclip = None
 
-try:
-    from pynput import keyboard, mouse
-except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
+if sys.platform == "win32":
+    try:
+        from pynput import keyboard, mouse
+    except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
+        keyboard = None
+        mouse = None
+else:
     keyboard = None
     mouse = None
 

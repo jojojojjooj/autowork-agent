@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import tkinter as tk
@@ -134,9 +135,12 @@ try:
 except ImportError:
     from app.policies import DEFAULT_POLICY_PROFILE, POLICY_PROFILES, review_plan
 
-try:
-    import pyautogui
-except (Exception, SystemExit):  # noqa: BLE001
+if sys.platform == "win32":
+    try:
+        import pyautogui
+    except (Exception, SystemExit):  # noqa: BLE001
+        pyautogui = None
+else:
     pyautogui = None
 
 try:
@@ -144,9 +148,12 @@ try:
 except (Exception, SystemExit):  # noqa: BLE001
     pyperclip = None
 
-try:
-    from pynput import keyboard as pynput_keyboard
-except (Exception, SystemExit):  # noqa: BLE001
+if sys.platform == "win32":
+    try:
+        from pynput import keyboard as pynput_keyboard
+    except (Exception, SystemExit):  # noqa: BLE001
+        pynput_keyboard = None
+else:
     pynput_keyboard = None
 
 
