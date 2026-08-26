@@ -43,6 +43,7 @@ from app.engine import (
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
+    validate_runtime_config,
     validate_schedule_interval,
     validate_workflow,
     resolve_observed_element,
@@ -569,6 +570,27 @@ def test_sensitive_text_masking_and_history_summary():
     assert summary["completed_runs"] == 1
     assert summary["failed_runs"] == 1
     assert summary["success_rate"] == 50.0
+
+
+def test_runtime_config_validation_resets_unsafe_values():
+    config, reset_fields = validate_runtime_config({
+        "endpoint": "https://example.com/v1",
+        "model": "   ",
+        "timeout": 1,
+        "vision": "true",
+        "capture_on_error": True,
+        "dry_run": False,
+        "schedule_interval": 10,
+        "document_roots": "C:/untrusted",
+    })
+    assert config["endpoint"] == "http://127.0.0.1:11434/v1"
+    assert config["model"] == "gemma4:e2b"
+    assert config["timeout"] == 120
+    assert config["vision"] is False
+    assert config["dry_run"] is False
+    assert config["schedule_interval"] == 3600
+    assert config["document_roots"] == []
+    assert {"endpoint", "model", "timeout", "vision", "schedule_interval", "document_roots"}.issubset(reset_fields)
 
 
 def test_local_endpoint_and_timeout_are_strictly_bounded():
