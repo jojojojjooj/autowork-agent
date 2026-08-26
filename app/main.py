@@ -124,6 +124,7 @@ class AutoWorkAgent(tk.Tk):
         self.recorder = InputRecorder(on_step=self._on_recorded_step, on_error=self._on_recorder_error)
         self.player = WorkflowPlayer(on_step=self._on_play_step, on_status=self._set_status, on_error=self._on_player_error)
         self.scheduler = LocalScheduler(self._scheduled_run)
+        self._scheduler_circuit_override = False
 
         self._load_config()
         self._build_style()
@@ -1614,14 +1615,38 @@ class AutoWorkAgent(tk.Tk):
     def _start_scheduler(self) -> None:
         try:
             interval = validate_schedule_interval(self.schedule_interval_var.get().strip())
+            health = evaluate_scheduler_health()
+            circuit_override = False
+            if health["circuit_open"]:
+                approved = messagebox.askyesno(
+                    "예약 실행 회로차단",
+                    f"최근 예약 실행이 {health['consecutive_failures']}회 연속 실패해 자동 중지되었습니다.\\n"
+                    "오류 리포트와 현재 화면을 확인했습니까? 확인된 경우에만 1회 재시작을 승인할 수 있습니다.",
+                )
+                if not approved:
+                    append_execution_history(
+                        "scheduler_restart_denied", self.workflow,
+                        consecutive_failures=health["consecutive_failures"],
+                    )
+                    self._set_status("예약 실행 재시작 대기 · 원인 확인 필요")
+                    return
+                circuit_override = True
             self.scheduler.start(interval)
+            self._scheduler_circuit_override = circuit_override
             self.schedule_status_var.set(f"예약 실행 중 · {interval}초 간격")
-            append_execution_history("scheduler_started", self.workflow, interval_seconds=interval)
+            append_execution_history(
+                "scheduler_restart_approved" if circuit_override else "scheduler_started",
+                self.workflow,
+                interval_seconds=interval,
+                consecutive_failures=health["consecutive_failures"] if circuit_override else 0,
+            )
             self._set_status(f"예약 실행 시작 · {interval}초 간격")
         except Exception as exc:
+            self._scheduler_circuit_override = False
             messagebox.showerror("예약 실행 시작 실패", str(exc))
 
     def _stop_scheduler(self) -> None:
+        self._scheduler_circuit_override = False
         self.scheduler.stop()
         if hasattr(self, "schedule_status_var"):
             self.schedule_status_var.set("예약 실행 중지")
@@ -1641,16 +1666,26 @@ class AutoWorkAgent(tk.Tk):
             return
         audit = verify_execution_history()
         if not audit["valid"]:
+            self._scheduler_circuit_override = False
+            self.scheduler.stop()
             append_execution_history("scheduled_run_skipped", self.workflow, reason="audit_integrity_failure")
-            self._set_status("예약 실행 중지 · 감사 이력 무결성 오류")
+            self.schedule_status_var.set("예약 실행 자동 중지 · 감사 이력 무결성 오류")
+            self._set_status("예약 실행 자동 중지 · 감사 이력 무결성 오류")
             return
         scheduler_health = evaluate_scheduler_health()
         if scheduler_health["circuit_open"]:
-            append_execution_history("scheduler_circuit_open", self.workflow, consecutive_failures=scheduler_health["consecutive_failures"])
-            self.scheduler.stop()
-            self.schedule_status_var.set("예약 실행 자동 중지 · 반복 실패")
-            self._set_status("예약 실행 자동 중지 · 반복 실패")
-            return
+            if self._scheduler_circuit_override:
+                self._scheduler_circuit_override = False
+                append_execution_history(
+                    "scheduler_circuit_override", self.workflow,
+                    consecutive_failures=scheduler_health["consecutive_failures"],
+                )
+            else:
+                append_execution_history("scheduler_circuit_open", self.workflow, consecutive_failures=scheduler_health["consecutive_failures"])
+                self.scheduler.stop()
+                self.schedule_status_var.set("예약 실행 자동 중지 · 반복 실패")
+                self._set_status("예약 실행 자동 중지 · 반복 실패")
+                return
         valid, reason = validate_workflow(self.workflow, get_screen_size())
         if not valid:
             append_execution_history("scheduled_run_skipped", self.workflow, reason="invalid_workflow")
