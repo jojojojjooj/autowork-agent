@@ -533,6 +533,16 @@ def test_ai_plan_rejects_unknown_element():
     assert "현재 화면에 없습니다" in message
 
 
+def test_local_ai_extract_content_rejects_malformed_responses():
+    with pytest.raises(RuntimeError, match="JSON 객체"):
+        LocalAIClient._extract_content([])
+    with pytest.raises(RuntimeError, match="choices"):
+        LocalAIClient._extract_content({"choices": []})
+    with pytest.raises(RuntimeError, match="content"):
+        LocalAIClient._extract_content({"choices": [{"message": {"content": ""}}]})
+    assert LocalAIClient._extract_content({"choices": [{"message": {"content": "ok"}}]}) == "ok"
+
+
 def test_json_parser_accepts_markdown_fence():
     parsed = LocalAIClient._parse_json('```json\n{"summary":"ok","risk":"low","steps":[]}\n```')
     assert parsed["summary"] == "ok"
@@ -573,6 +583,48 @@ def test_local_ai_health_check_reads_models_only(monkeypatch):
     assert result["reachable"] is True
     assert result["models"] == ["local-model"]
     assert calls == [("http://127.0.0.1:11434/v1/models", 5, False)]
+
+
+def test_local_ai_health_check_rejects_malformed_models_payloads(monkeypatch):
+    import requests
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    payloads = [{}, {"data": "not-a-list"}, [], {"data": ["not-an-object"]}]
+    for payload in payloads:
+        monkeypatch.setattr(requests, "get", lambda *args, payload=payload, **kwargs: FakeResponse(payload))
+        with pytest.raises(RuntimeError, match="응답 형식"):
+            LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model").health_check()
+
+
+def test_local_ai_make_plan_rejects_malformed_completion(monkeypatch):
+    import requests
+
+    class FakeResponse:
+        status_code = 200
+        content = b"{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": []}}]}
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeResponse())
+    with pytest.raises(engine.RetryableAutomationError, match="응답 형식"):
+        LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model").make_plan(
+            "상태 확인", {"elements": [], "screen_size": [1920, 1080]}
+        )
 
 
 def test_workflow_is_saved_as_version_2_and_rejects_unsafe_steps(tmp_path: Path):

@@ -1757,8 +1757,17 @@ class LocalAIClient:
             response.raise_for_status()
             self._ensure_bounded_response(response)
             payload = response.json()
-            models = payload.get("data", []) if isinstance(payload, dict) else []
-            model_names = [str(item.get("id", "")) for item in models if isinstance(item, dict) and item.get("id")]
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise ValueError("/models 응답의 data 배열이 없습니다.")
+            models = payload["data"]
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not item["id"].strip()
+                for item in models
+            ):
+                raise ValueError("/models 응답의 data 항목 형식이 올바르지 않습니다.")
+            model_names = [item["id"].strip() for item in models]
             return {"reachable": True, "status_code": response.status_code, "models": model_names[:50]}
         except requests.RequestException as exc:
             raise RuntimeError(f"로컬 AI 서버에 연결할 수 없습니다: {exc}") from exc
@@ -1791,15 +1800,25 @@ class LocalAIClient:
             raise RuntimeError("로컬 AI 서버 응답이 허용 크기를 초과합니다.")
 
     @staticmethod
-    def _extract_content(response: dict[str, Any]) -> str:
-        choices = response.get("choices") or []
-        if not choices:
-            raise RuntimeError("로컬 AI 서버 응답에 choices가 없습니다.")
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
+    def _extract_content(response: Any) -> str:
+        if not isinstance(response, dict):
+            raise RuntimeError("로컬 AI 서버 응답이 JSON 객체가 아닙니다.")
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("로컬 AI 서버 응답에 유효한 choices가 없습니다.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("로컬 AI 서버 응답에 유효한 message가 없습니다.")
+        content = message.get("content")
         if isinstance(content, list):
-            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return str(content)
+            text = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("text") is not None)
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = ""
+        if not text.strip():
+            raise RuntimeError("로컬 AI 서버 응답에 content가 없습니다.")
+        return text
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
@@ -1906,9 +1925,11 @@ class LocalAIClient:
             detail = getattr(getattr(exc, "response", None), "text", "")[:500]
             raise RuntimeError(f"로컬 AI 요청에 실패했습니다: {exc}{(' · ' + detail) if detail else ''}") from exc
         try:
-            raw = self._parse_json(self._extract_content(response.json()))
-        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("로컬 AI 서버 응답 형식이 올바르지 않습니다.") from exc
+            response_payload = response.json()
+            content_text = self._extract_content(response_payload)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise RetryableAutomationError(f"로컬 AI 서버 응답 형식이 올바르지 않습니다: {exc}") from exc
+        raw = self._parse_json(content_text)
         try:
             return AutomationPlan.model_validate(raw).model_dump(mode="json")
         except ValidationError as exc:
