@@ -58,7 +58,7 @@ AI가 반환할 수 있는 동작은 `click`, `double_click`, `type`, `hotkey`, 
 .\build_windows.bat
 ```
 
-Python, Tesseract, Ollama 또는 LM Studio의 설치파일과 모델 파일은 조직의 승인된 반입 절차를 따르십시오. Tesseract를 사용할 경우 Windows 실행 파일과 `kor`·`eng` 언어 데이터를 별도로 점검해야 합니다. 저장소 루트에서 `python -m app.release .`를 실행하면 필수 파일, 모든 lock 의존성의 `==` 고정 여부, 설치·실행·빌드 배치 파일의 오프라인 안전 표식을 정적으로 확인할 수 있습니다. 이 검사는 Windows 설치·실행·빌드를 대신하지 않으므로 운영 전 실제 Windows smoke test가 필요합니다.
+Python, Tesseract, Ollama 또는 LM Studio의 설치파일과 모델 파일은 조직의 승인된 반입 절차를 따르십시오. Tesseract를 사용할 경우 Windows 실행 파일과 `kor`·`eng` 언어 데이터를 별도로 점검해야 합니다. 저장소 루트에서 `python -m app.release .`를 실행하면 필수 파일, 모든 lock 의존성의 `==` 고정 여부, 설치·실행·빌드 배치 파일의 오프라인 안전 표식을 정적으로 확인할 수 있습니다. 이 검사는 Windows 설치·실행·빌드를 대신하지 않으므로 운영 전 실제 Windows smoke test가 필요합니다. `.github/workflows/windows-smoke.yml`은 GitHub-hosted Windows runner에서 고정 의존성 설치, 런타임 import, 회귀 테스트, PyInstaller 산출물 생성을 자동 확인하지만, 업무용 대상 앱을 열어 입력하거나 문서를 변경하지 않습니다.
 
 ## 운영 전 보안 검토 항목
 
@@ -75,7 +75,7 @@ Python, Tesseract, Ollama 또는 LM Studio의 설치파일과 모델 파일은 �
 11. 예약 실행 전에는 작업의 안전 점검을 수행하고, 기록된 대상 창·화면 크기·단계 수를 확인합니다. 반복 실패 회로차단이 열린 경우 오류 리포트·화면 상태·감사 무결성을 확인하기 전 예약을 재시작하지 않습니다.
 12. 실행 리포트 폴더와 대시보드·export가 읽는 진단 데이터의 ACL·보존기간·삭제 절차를 별도로 승인하고, 리포트를 외부 로그나 클라우드로 전송하지 않습니다.
 13. 결재, 메일 발송, 문서 게시, 파일 삭제, 개인정보 입력은 사용자가 직접 처리합니다.
-14. 배포 전 `python -m app.release .`의 정적 검사 결과를 보관하고, 별도 승인된 Windows 환경에서 설치·실행·빌드 smoke test를 수행합니다.
+14. 배포 전 `python -m app.release .`의 정적 검사 결과와 GitHub Windows Smoke workflow 결과를 보관하고, 별도 승인된 Windows 환경에서 설치·실행·빌드 smoke test를 수행합니다.
 
 ## 배포 검증 권장 명령
 

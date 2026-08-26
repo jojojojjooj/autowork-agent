@@ -1,0 +1,53 @@
+name: Windows Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validation:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pinned dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --requirement requirements-dev.txt
+      - name: Check Windows runtime imports
+        shell: pwsh
+        run: |
+          python -c "import tkinter, pyautogui, pywinauto, pytesseract; print('Windows runtime imports: OK')"
+      - name: Run regression tests
+        shell: pwsh
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m py_compile app/engine.py app/main.py app/adapters.py app/policies.py app/release.py
+      - name: Validate offline release layout
+        shell: pwsh
+        run: python -m app.release .
+      - name: Build Windows executable
+        shell: pwsh
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name AutoWorkAgent app/main.py
+      - name: Verify executable output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/AutoWorkAgent.exe")) { throw "dist/AutoWorkAgent.exe was not created" }
+          $size = (Get-Item "dist/AutoWorkAgent.exe").Length
+          if ($size -le 0) { throw "dist/AutoWorkAgent.exe is empty" }
+          Write-Host "Windows executable created: $size bytes"
