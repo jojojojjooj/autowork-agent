@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
 import re
 import zipfile
 from defusedxml import ElementTree as SafeElementTree
 from html import escape as xml_escape
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    from engine import atomic_write_bytes, atomic_write_text
+except ImportError:  # pragma: no cover - package import path
+    from app.engine import atomic_write_bytes, atomic_write_text
 
 
 EXCEL_CELL_RE = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})(?![A-Za-z0-9_])")
@@ -233,20 +237,10 @@ def update_approved_text_document(
     after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
     backup_name = f".{resolved.name}.autowork-{before_hash[:12]}.bak"
     backup = resolved.with_name(backup_name)
-    temporary_backup = backup.with_name(f".{backup.name}.tmp")
-    temporary_target = resolved.with_name(f".{resolved.name}.tmp")
     try:
-        temporary_backup.write_text(current, encoding="utf-8")
-        os.replace(temporary_backup, backup)
-        temporary_target.write_text(updated, encoding="utf-8")
-        os.replace(temporary_target, resolved)
+        atomic_write_text(backup, current)
+        atomic_write_text(resolved, updated)
     except OSError as exc:
-        for temporary in (temporary_backup, temporary_target):
-            try:
-                if temporary.exists():
-                    temporary.unlink()
-            except OSError:
-                pass
         raise OSError(f"문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc
     return {
         "relative_path": str(resolved.relative_to(root)),
@@ -344,20 +338,10 @@ def update_approved_office_document(
         raise ValueError("변경 후 Office 문서가 허용 크기를 초과합니다.")
     after_hash = hashlib.sha256(updated).hexdigest()
     backup = resolved.with_name(f".{resolved.name}.autowork-{before_hash[:12]}.bak")
-    temporary_backup = backup.with_name(f".{backup.name}.tmp")
-    temporary_target = resolved.with_name(f".{resolved.name}.tmp")
     try:
-        temporary_backup.write_bytes(original)
-        os.replace(temporary_backup, backup)
-        temporary_target.write_bytes(updated)
-        os.replace(temporary_target, resolved)
+        atomic_write_bytes(backup, original)
+        atomic_write_bytes(resolved, updated)
     except OSError as exc:
-        for temporary in (temporary_backup, temporary_target):
-            try:
-                if temporary.exists():
-                    temporary.unlink()
-            except OSError:
-                pass
         raise OSError(f"Office 문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc
     return {
         "relative_path": str(resolved.relative_to(root)),
@@ -459,16 +443,9 @@ def restore_document_backup(
     root = approved[0]
     resolved = (root / Path(relative_path)).resolve()
     backup = root / Path(verification["backup_relative_path"])
-    temporary = resolved.with_name(f".{resolved.name}.restore.tmp")
     try:
-        temporary.write_bytes(backup.read_bytes())
-        os.replace(temporary, resolved)
+        atomic_write_bytes(resolved, backup.read_bytes())
     except OSError as exc:
-        try:
-            if temporary.exists():
-                temporary.unlink()
-        except OSError:
-            pass
         raise OSError(f"문서 백업을 원자적으로 복구하지 못했습니다: {exc}") from exc
     restored_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
     if restored_sha != backup_expected:

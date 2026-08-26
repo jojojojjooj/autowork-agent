@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -77,6 +78,35 @@ PII_PATTERNS = (
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
 _MONITOR_LOCK = threading.Lock()
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Write bytes through a private same-directory temporary file and replace atomically."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    atomic_write_bytes(Path(path), content.encode("utf-8"))
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -160,10 +190,8 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
         with _HISTORY_LOCK:
             if HISTORY_PATH.exists() and HISTORY_PATH.stat().st_size >= MAX_HISTORY_FILE_BYTES:
                 previous = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-                temporary = HISTORY_PATH.with_name(f".{HISTORY_PATH.name}.tmp")
                 kept = previous[-MAX_HISTORY_RECORDS_ON_ROTATE:]
-                temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-                os.replace(temporary, HISTORY_PATH)
+                atomic_write_text(HISTORY_PATH, "\n".join(kept) + ("\n" if kept else ""))
             record: Dict[str, Any] = {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "event": str(event)[:80],
@@ -286,9 +314,7 @@ def trim_execution_history(max_bytes: int = MAX_HISTORY_FILE_BYTES) -> None:
                 kept.append(line)
                 total += encoded_size
             kept.reverse()
-            temporary = HISTORY_PATH.with_suffix(".tmp")
-            temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-            os.replace(temporary, HISTORY_PATH)
+            atomic_write_text(HISTORY_PATH, "\n".join(kept) + ("\n" if kept else ""))
     except (OSError, ValueError) as exc:
         append_log(f"실행 이력 정리 실패: {exc}", "WARNING")
 
@@ -412,14 +438,8 @@ def write_monitor_snapshot(snapshot: Dict[str, Any]) -> Path:
     ensure_app_dirs()
     payload = redact_sensitive(dict(snapshot))
     payload.setdefault("schema_version", MONITOR_SCHEMA_VERSION)
-    temporary = MONITOR_STATE_PATH.with_suffix(".tmp")
-    try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        with _MONITOR_LOCK:
-            os.replace(temporary, MONITOR_STATE_PATH)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    with _MONITOR_LOCK:
+        atomic_write_text(MONITOR_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
     return MONITOR_STATE_PATH
 
 
@@ -460,13 +480,7 @@ def export_support_bundle(target: Path) -> Path:
     encoded = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
     if len(encoded) > 5 * 1024 * 1024:
         raise ValueError("지원 진단 패키지가 5MB 제한을 초과했습니다.")
-    temporary = destination.with_suffix(".tmp")
-    try:
-        temporary.write_bytes(encoded)
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_bytes(destination, encoded)
     return destination
 
 
@@ -504,10 +518,8 @@ def write_execution_report(
         "policy_profile": str(policy_profile)[:80],
     }
     report_path = RUN_REPORT_DIR / f"run_{safe_run_id}_{int(time.time() * 1000)}.json"
-    temporary = report_path.with_suffix(".tmp")
     try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, report_path)
+        atomic_write_text(report_path, json.dumps(payload, ensure_ascii=False, indent=2))
         reports = sorted(RUN_REPORT_DIR.glob("run_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
         for stale in reports[MAX_RUN_REPORTS:]:
             try:
@@ -516,10 +528,6 @@ def write_execution_report(
                 pass
         return report_path
     except (OSError, TypeError, ValueError) as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
         append_log(f"실행 리포트 저장 실패: {exc}", "WARNING")
         return None
 
@@ -641,13 +649,7 @@ def export_execution_report_summary(target: Path, period_days: int = 30) -> Path
         raise ValueError("실행 리포트 요약 export가 2MB 제한을 초과했습니다.")
     destination = Path(target)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp")
-    try:
-        temporary.write_bytes(encoded)
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_bytes(destination, encoded)
     return destination
 
 
@@ -669,14 +671,10 @@ def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workf
         "mode": str(mode)[:40],
         "error_type": str(error_type)[:120],
     }
-    temporary = CHECKPOINT_PATH.with_suffix(".tmp")
     try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, CHECKPOINT_PATH)
+        atomic_write_text(CHECKPOINT_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
     except OSError as exc:
         append_log(f"실행 체크포인트 저장 실패: {exc}", "WARNING")
-        if temporary.exists():
-            temporary.unlink()
 
 
 def load_execution_checkpoint() -> Optional[Dict[str, Any]]:
@@ -1115,9 +1113,7 @@ def _get_workflow_signing_key() -> bytes:
             if len(key) >= 32:
                 return key
         key = secrets.token_bytes(32)
-        temporary = WORKFLOW_KEY_PATH.with_suffix(".tmp")
-        temporary.write_bytes(key)
-        os.replace(temporary, WORKFLOW_KEY_PATH)
+        atomic_write_bytes(WORKFLOW_KEY_PATH, key)
         try:
             os.chmod(WORKFLOW_KEY_PATH, 0o600)
         except OSError:
@@ -1879,13 +1875,7 @@ def save_workflow(workflow: Workflow, path: Path) -> Optional[Path]:
     payload = json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2)
     if len(payload.encode("utf-8")) > MAX_WORKFLOW_FILE_BYTES:
         raise ValueError("작업 파일이 너무 큽니다.")
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_text(payload, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_text(path, payload)
     return backup_path
 
 
@@ -1961,13 +1951,7 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
                 except OSError:
                     pass
     payload["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    temporary = target.with_name(f".{target.name}.tmp")
-    try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, target)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
 
