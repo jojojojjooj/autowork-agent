@@ -242,9 +242,10 @@ def update_approved_text_document(
     if resolved.suffix.casefold() not in TEXT_MUTATION_SUFFIXES:
         raise ValueError("변경은 승인된 텍스트 문서 확장자만 지원합니다.")
     try:
-        if resolved.stat().st_size > MAX_DOCUMENT_BYTES:
+        original_bytes = resolved.read_bytes()
+        if len(original_bytes) > MAX_DOCUMENT_BYTES:
             raise ValueError("변경 대상 문서가 허용 크기를 초과합니다.")
-        current = resolved.read_text(encoding="utf-8")
+        current = original_bytes.decode("utf-8")
     except (OSError, UnicodeError) as exc:
         raise ValueError("문서를 UTF-8 텍스트로 읽을 수 없습니다.") from exc
     old = str(expected_text or "")
@@ -254,12 +255,14 @@ def update_approved_text_document(
     if current.count(old) != 1:
         raise ValueError("변경 전 확인 문자열은 문서에서 정확히 한 번만 나타나야 합니다.")
     updated = current.replace(old, new, 1)
-    before_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
+    before_hash = hashlib.sha256(original_bytes).hexdigest()
     after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
     backup_name = f".{resolved.name}.autowork-{before_hash[:12]}.bak"
     backup = resolved.with_name(backup_name)
     try:
         atomic_write_text(backup, current)
+        if hashlib.sha256(resolved.read_bytes()).hexdigest() != before_hash:
+            raise ValueError("변경 직전 문서가 변경되어 저장을 중단했습니다.")
         atomic_write_text(resolved, updated)
     except OSError as exc:
         raise OSError(f"문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc
@@ -363,6 +366,8 @@ def update_approved_office_document(
     backup = resolved.with_name(f".{resolved.name}.autowork-{before_hash[:12]}.bak")
     try:
         atomic_write_bytes(backup, original)
+        if hashlib.sha256(resolved.read_bytes()).hexdigest() != before_hash:
+            raise ValueError("변경 직전 Office 문서가 변경되어 저장을 중단했습니다.")
         atomic_write_bytes(resolved, updated)
     except OSError as exc:
         raise OSError(f"Office 문서 변경을 원자적으로 저장하지 못했습니다: {exc}") from exc

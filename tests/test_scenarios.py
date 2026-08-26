@@ -478,3 +478,49 @@ def test_scenario_restore_rejects_backup_changed_after_verification(tmp_path: Pa
             confirmed=True,
         )
     assert document.read_text(encoding="utf-8") == "상태: 완료\n"
+
+
+def test_scenario_text_update_rejects_change_before_atomic_replace(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "update-race.txt"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+    original_atomic_write = adapters.atomic_write_text
+    calls = 0
+
+    def write_then_external_change(path, content):
+        nonlocal calls
+        original_atomic_write(path, content)
+        calls += 1
+        if calls == 1:
+            document.write_text("외부 변경\n", encoding="utf-8")
+
+    monkeypatch.setattr(adapters, "atomic_write_text", write_then_external_change)
+    with pytest.raises(ValueError, match="변경 직전 문서"):
+        update_approved_text_document(
+            [str(approved)], "update-race.txt", "상태: 초안", "상태: 완료", confirmed=True
+        )
+    assert document.read_text(encoding="utf-8") == "외부 변경\n"
+
+
+def test_scenario_office_update_rejects_change_before_atomic_replace(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "update-race.docx"
+    _write_office_fixture(document, ".docx", "상태: 초안")
+    original_atomic_write = adapters.atomic_write_bytes
+    calls = 0
+
+    def write_then_external_change(path, content):
+        nonlocal calls
+        original_atomic_write(path, content)
+        calls += 1
+        if calls == 1:
+            document.write_bytes("외부 변경".encode())
+
+    monkeypatch.setattr(adapters, "atomic_write_bytes", write_then_external_change)
+    with pytest.raises(ValueError, match="변경 직전 Office 문서"):
+        update_approved_office_document(
+            [str(approved)], "update-race.docx", "상태: 초안", "상태: 완료", confirmed=True
+        )
+    assert document.read_bytes() == "외부 변경".encode()

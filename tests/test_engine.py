@@ -27,6 +27,7 @@ from app.engine import (
     backup_workflow,
     build_execution_report_dashboard,
     build_monitor_snapshot,
+    capture_observation,
     cleanup_workflow_backups,
     clear_execution_checkpoint,
     compare_prompt_template_versions,
@@ -1075,3 +1076,103 @@ def test_load_missing_persistence_files_fail_closed(tmp_path: Path):
         load_prompt_template(tmp_path / "missing-template.json")
     with pytest.raises(ValueError, match="작업 파일을 읽을 수 없습니다"):
         load_workflow(tmp_path / "missing-workflow.json")
+
+
+def test_workflow_player_paste_restores_clipboard_on_failure(monkeypatch):
+    class FakeClipboard:
+        def __init__(self):
+            self.value = "original"
+            self.copies = []
+
+        def paste(self):
+            return self.value
+
+        def copy(self, value):
+            self.copies.append(value)
+            self.value = value
+
+    class FailingPyAutoGUI:
+        @staticmethod
+        def hotkey(_modifier, _key):
+            raise RuntimeError("paste failed")
+
+    clipboard = FakeClipboard()
+    monkeypatch.setattr(engine, "pyperclip", clipboard)
+    monkeypatch.setattr(engine, "pyautogui", FailingPyAutoGUI())
+
+    with pytest.raises(RuntimeError, match="paste failed"):
+        WorkflowPlayer._paste("secret")
+    assert clipboard.value == "original"
+    assert clipboard.copies == ["secret", "original"]
+
+
+def test_local_ai_make_plan_rejects_oversized_request_context(monkeypatch):
+    import requests
+
+    calls = []
+
+    def unexpected_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("oversized context must not reach HTTP")
+
+    monkeypatch.setattr(requests, "post", unexpected_post)
+    oversized_context = {str(index): "x" * 12_000 for index in range(100)}
+
+    with pytest.raises(ValueError, match="요청 컨텍스트"):
+        LocalAIClient(endpoint="http://127.0.0.1:11434/v1", model="local-model").make_plan(
+            "상태 확인", {"application_context": oversized_context}
+        )
+    assert calls == []
+
+
+def test_capture_observation_rejects_oversized_saved_image(tmp_path: Path, monkeypatch):
+    class OversizedImage:
+        size = (1920, 1080)
+
+        @staticmethod
+        def save(path):
+            path.write_bytes(b"oversized")
+
+    class FakePyAutoGUI:
+        @staticmethod
+        def screenshot():
+            return OversizedImage()
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(engine, "pyautogui", FakePyAutoGUI())
+    monkeypatch.setattr(engine, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(engine, "MAX_CAPTURE_IMAGE_BYTES", 1)
+    monkeypatch.setattr(engine, "ensure_app_dirs", lambda: cache_dir.mkdir(parents=True, exist_ok=True))
+
+    with pytest.raises(ValueError, match="캡처가 허용 크기"):
+        capture_observation()
+    assert list(cache_dir.iterdir()) == []
+
+
+def test_workflow_from_dict_rejects_coerced_coordinates_and_metadata():
+    with pytest.raises(ValueError, match="좌표는 정수"):
+        Workflow.from_dict({"version": 2, "steps": [{"type": "click", "x": 1.5, "y": 2, "button": "left"}]})
+    with pytest.raises(ValueError, match="화면 크기 정보는 정수"):
+        Workflow.from_dict({"version": 2, "recorded_screen_size": [1920.0, 1080], "steps": []})
+    with pytest.raises(ValueError, match="지원하지 않는 작업 파일 버전"):
+        Workflow.from_dict({"version": True, "steps": []})
+
+
+def test_validate_workflow_rejects_non_integer_coordinates():
+    valid, message = validate_workflow(
+        Workflow(steps=[Step(type="click", x=1.5, y=2, button="left")]),
+        (1920, 1080),
+    )
+    assert valid is False
+    assert "좌표는 정수" in message
+
+
+def test_numeric_validators_reject_float_and_bool_coercion():
+    assert validate_schedule_interval("60") == 60
+    assert validate_timeout("30") == 30
+    for value in (60.5, True):
+        with pytest.raises(ValueError, match="예약 간격"):
+            validate_schedule_interval(value)
+    for value in (30.5, True):
+        with pytest.raises(ValueError, match="응답 제한 시간"):
+            validate_timeout(value)

@@ -76,6 +76,8 @@ MAX_SCHEDULE_INTERVAL_SECONDS = 24 * 60 * 60
 MAX_CONFIG_FILE_BYTES = 256 * 1024
 MAX_AI_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_AI_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_AI_REQUEST_BYTES = 512 * 1024
+MAX_CAPTURE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
 MAX_LOG_RECORDS_ON_ROTATE = 1_000
 AUDIT_HASH_VERSION = 1
@@ -152,6 +154,26 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_sensitive(item) for item in value)
     return value
+
+
+def _bound_prompt_context(value: Any, depth: int = 0) -> Any:
+    """Keep externally supplied planning context bounded before serializing a request."""
+    if depth >= 4:
+        return str(value)[:500]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _bound_prompt_context(item, depth + 1)
+            for key, item in list(value.items())[:100]
+        }
+    if isinstance(value, list):
+        return [_bound_prompt_context(item, depth + 1) for item in value[:120]]
+    if isinstance(value, tuple):
+        return [_bound_prompt_context(item, depth + 1) for item in value[:120]]
+    if isinstance(value, str):
+        return value[:12_000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:500]
 
 
 def mask_sensitive_text(text: str) -> str:
@@ -281,10 +303,14 @@ def verify_execution_history(records: list[dict[str, Any]] | None = None) -> dic
 
 def validate_schedule_interval(value: Any) -> int:
     """Validate a low-frequency local schedule interval in seconds."""
-    try:
-        interval = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("예약 간격은 정수 초 단위여야 합니다.") from exc
+    if isinstance(value, bool):
+        raise ValueError("예약 간격은 정수 초 단위여야 합니다.")  # noqa: TRY004
+    if isinstance(value, int):
+        interval = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        interval = int(value.strip())
+    else:
+        raise ValueError("예약 간격은 정수 초 단위여야 합니다.")
     if not 60 <= interval <= MAX_SCHEDULE_INTERVAL_SECONDS:
         raise ValueError("예약 간격은 60초~24시간 범위여야 합니다.")
     return interval
@@ -496,7 +522,10 @@ def read_monitor_snapshot() -> dict[str, Any] | None:
 def export_support_bundle(target: Path) -> Path:
     """Export a bounded, local-only support bundle without workflow steps or screenshots."""
     ensure_app_dirs()
-    logs = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-300:] if LOG_PATH.exists() else []
+    try:
+        logs = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-300:] if LOG_PATH.exists() else []
+    except OSError:
+        logs = []
     errors = []
     for path in _files_by_mtime(ERROR_DIR, "error_*.json")[:50]:
         try:
@@ -805,10 +834,14 @@ def validate_local_endpoint(endpoint: str) -> str:
 
 def validate_timeout(value: Any) -> int:
     """Validate a bounded request timeout used for the local model."""
-    try:
-        timeout = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("응답 제한 시간은 정수여야 합니다.") from exc
+    if isinstance(value, bool):
+        raise ValueError("응답 제한 시간은 정수여야 합니다.")  # noqa: TRY004
+    if isinstance(value, int):
+        timeout = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        timeout = int(value.strip())
+    else:
+        raise ValueError("응답 제한 시간은 정수여야 합니다.")
     if not 5 <= timeout <= 600:
         raise ValueError("응답 제한 시간은 5~600초 범위여야 합니다.")
     return timeout
@@ -985,7 +1018,7 @@ class Workflow:
         if not isinstance(data, dict):
             raise TypeError("작업 파일의 최상위 형식은 JSON 객체여야 합니다.")
         version = data.get("version", 1)
-        if version not in {1, WORKFLOW_VERSION}:
+        if isinstance(version, bool) or version not in {1, WORKFLOW_VERSION}:
             raise ValueError(f"지원하지 않는 작업 파일 버전입니다: {version}")
         raw_steps = data.get("steps", [])
         if not isinstance(raw_steps, list):
@@ -1013,10 +1046,9 @@ class Workflow:
             if not math.isfinite(delay) or not 0 <= delay <= MAX_STEP_DELAY:
                 raise ValueError(f"{index}번째 단계의 대기 시간은 0~60초여야 합니다.")
             if step.type == "click":
-                try:
-                    x, y = int(step.x), int(step.y)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ValueError(f"{index}번째 클릭 좌표가 올바르지 않습니다.") from exc
+                if type(step.x) is not int or type(step.y) is not int:
+                    raise ValueError(f"{index}번째 클릭 좌표는 정수여야 합니다.")
+                x, y = step.x, step.y
                 if not (-100_000 <= x <= 100_000 and -100_000 <= y <= 100_000):
                     raise ValueError(f"{index}번째 클릭 좌표가 올바르지 않습니다.")
                 if not isinstance(step.button, str) or step.button not in allowed_buttons:
@@ -1050,10 +1082,9 @@ class Workflow:
         if recorded_screen_size is not None:
             if not isinstance(recorded_screen_size, (list, tuple)) or len(recorded_screen_size) != 2:
                 raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.")
-            try:
-                recorded_screen_size = [int(recorded_screen_size[0]), int(recorded_screen_size[1])]
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.") from exc
+            if any(type(value) is not int for value in recorded_screen_size):
+                raise ValueError("기록 당시 화면 크기 정보는 정수여야 합니다.")
+            recorded_screen_size = [recorded_screen_size[0], recorded_screen_size[1]]
             if any(value <= 0 for value in recorded_screen_size):
                 raise ValueError("기록 당시 화면 크기는 양수여야 합니다.")
         return cls(
@@ -1351,14 +1382,16 @@ class WorkflowPlayer:
             previous = pyperclip.paste()
         except Exception:  # noqa: BLE001
             previous = None
-        pyperclip.copy(text)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.03)
-        if previous is not None:
-            try:
-                pyperclip.copy(previous)
-            except Exception:  # noqa: BLE001
-                return
+        try:
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.03)
+        finally:
+            if previous is not None:
+                try:
+                    pyperclip.copy(previous)
+                except Exception:  # noqa: BLE001
+                    return
 
     @classmethod
     def _key_name(cls, kind: str, value: str) -> str:
@@ -1535,10 +1568,9 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
         if step.type == "click":
             if step.x is None or step.y is None:
                 return False, f"{index}번째 클릭 단계에 좌표가 없습니다."
-            try:
-                x, y = int(step.x), int(step.y)
-            except (TypeError, ValueError, OverflowError):
-                return False, f"{index}번째 클릭 단계의 좌표가 숫자가 아닙니다."
+            if type(step.x) is not int or type(step.y) is not int:
+                return False, f"{index}번째 클릭 단계의 좌표는 정수여야 합니다."
+            x, y = step.x, step.y
             if not (0 <= x < width and 0 <= y < height):
                 return False, f"{index}번째 클릭 좌표가 화면 밖입니다."
             if not isinstance(step.button, str) or step.button not in WorkflowPlayer.BUTTONS:
@@ -1652,7 +1684,21 @@ def capture_observation() -> dict[str, Any]:
         raise RuntimeError("pyautogui가 설치되어 있지 않습니다.")
     image_path = CACHE_DIR / f"observation_{time.time_ns()}.png"
     image = pyautogui.screenshot()
-    image.save(image_path)
+    try:
+        image.save(image_path)
+        image_size = image_path.stat().st_size
+    except (OSError, ValueError) as exc:
+        try:
+            image_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"화면 캡처를 저장할 수 없습니다: {exc}") from exc
+    if image_size > MAX_CAPTURE_IMAGE_BYTES:
+        try:
+            image_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError("화면 캡처가 허용 크기를 초과합니다.")
 
     active_window = ""
     ui_controls: list[dict[str, Any]] = []
@@ -1758,7 +1804,7 @@ class LocalAIClient:
             self._ensure_bounded_response(response)
             payload = response.json()
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-                raise ValueError("/models 응답의 data 배열이 없습니다.")
+                raise ValueError("/models 응답의 data 배열이 없습니다.")  # noqa: TRY004
             models = payload["data"]
             if any(
                 not isinstance(item, dict)
@@ -1802,13 +1848,13 @@ class LocalAIClient:
     @staticmethod
     def _extract_content(response: Any) -> str:
         if not isinstance(response, dict):
-            raise RuntimeError("로컬 AI 서버 응답이 JSON 객체가 아닙니다.")
+            raise RuntimeError("로컬 AI 서버 응답이 JSON 객체가 아닙니다.")  # noqa: TRY004
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeError("로컬 AI 서버 응답에 유효한 choices가 없습니다.")
         message = choices[0].get("message")
         if not isinstance(message, dict):
-            raise RuntimeError("로컬 AI 서버 응답에 유효한 message가 없습니다.")
+            raise RuntimeError("로컬 AI 서버 응답에 유효한 message가 없습니다.")  # noqa: TRY004
         content = message.get("content")
         if isinstance(content, list):
             text = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("text") is not None)
@@ -1874,17 +1920,19 @@ class LocalAIClient:
         )
         user_text = {
             "goal": goal,
-            "active_window": observation.get("active_window", ""),
-            "screen_size": observation.get("screen_size", []),
-            "ocr_text": observation.get("ocr_text", ""),
-            "application_context": observation.get("application_context", {}),
-            "policy_profile": policy_profile,
-            "document_context": observation.get("document_context", {}),
-            "recovery_context": observation.get("recovery_context", {}),
-            "elements": observation.get("elements", [])[:120],
-            "frame_hash": observation.get("frame_hash", ""),
+            "active_window": str(observation.get("active_window", ""))[:160],
+            "screen_size": _bound_prompt_context(observation.get("screen_size", [])),
+            "ocr_text": str(observation.get("ocr_text", ""))[:12_000],
+            "application_context": _bound_prompt_context(observation.get("application_context", {})),
+            "policy_profile": policy_profile[:80],
+            "document_context": _bound_prompt_context(observation.get("document_context", {})),
+            "recovery_context": _bound_prompt_context(observation.get("recovery_context", {})),
+            "elements": _bound_prompt_context(observation.get("elements", [])[:120]),
+            "frame_hash": str(observation.get("frame_hash", ""))[:128],
         }
         content: Any = json.dumps(user_text, ensure_ascii=False)
+        if len(content.encode("utf-8")) > MAX_AI_REQUEST_BYTES:
+            raise ValueError("로컬 AI 요청 컨텍스트가 허용 크기를 초과합니다.")
         if self.vision and observation.get("image_path"):
             content = [
                 {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
