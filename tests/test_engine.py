@@ -44,6 +44,7 @@ from app.engine import (
     validate_local_endpoint,
     validate_timeout,
     validate_runtime_config,
+    load_runtime_config,
     validate_schedule_interval,
     validate_workflow,
     resolve_observed_element,
@@ -591,6 +592,20 @@ def test_runtime_config_validation_resets_unsafe_values():
     assert config["schedule_interval"] == 3600
     assert config["document_roots"] == []
     assert {"endpoint", "model", "timeout", "vision", "schedule_interval", "document_roots"}.issubset(reset_fields)
+
+
+def test_runtime_config_loader_rejects_oversized_and_malformed_files(tmp_path: Path):
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text("x" * (engine.MAX_CONFIG_FILE_BYTES + 1), encoding="utf-8")
+    config, reasons = load_runtime_config(oversized)
+    assert config["endpoint"] == "http://127.0.0.1:11434/v1"
+    assert "file_size" in reasons
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not-json", encoding="utf-8")
+    config, reasons = load_runtime_config(malformed)
+    assert config["dry_run"] is True
+    assert "file" in reasons
 
 
 def test_local_endpoint_and_timeout_are_strictly_bounded():

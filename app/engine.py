@@ -830,6 +830,27 @@ def validate_runtime_config(data: Any, defaults: Optional[Dict[str, Any]] = None
     return result, reset_fields
 
 
+def load_runtime_config(path: Path, defaults: Optional[Dict[str, Any]] = None) -> tuple[Dict[str, Any], List[str]]:
+    """Load a bounded JSON config and return safe values plus reset reasons."""
+    data: Dict[str, Any] = {}
+    reset_fields: List[str] = []
+    try:
+        config_path = Path(path)
+        if config_path.exists():
+            if config_path.stat().st_size > MAX_CONFIG_FILE_BYTES:
+                reset_fields.append("file_size")
+            else:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+                else:
+                    reset_fields.append("file_type")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        reset_fields.append("file")
+    config, invalid_fields = validate_runtime_config(data, defaults)
+    return config, reset_fields + invalid_fields
+
+
 class ObservedElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
