@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import hmac
+import io
 import json
 import math
 import os
@@ -14,27 +14,28 @@ import tempfile
 import threading
 import time
 import traceback
-from urllib.parse import urlparse
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, ClassVar, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 try:
     import pyautogui
-except Exception:  # pragma: no cover - Windows runtime dependency
+except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
     pyautogui = None
 
 try:
     import pyperclip
-except Exception:  # pragma: no cover - Windows runtime dependency
+except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
     pyperclip = None
 
 try:
     from pynput import keyboard, mouse
-except Exception:  # pragma: no cover - Windows runtime dependency
+except (Exception, SystemExit):  # pragma: no cover - Windows runtime dependency  # noqa: BLE001
     keyboard = None
     mouse = None
 
@@ -110,9 +111,9 @@ def atomic_write_text(path: Path, content: str) -> None:
     atomic_write_bytes(Path(path), content.encode("utf-8"))
 
 
-def _files_by_mtime(directory: Path, pattern: str) -> List[Path]:
+def _files_by_mtime(directory: Path, pattern: str) -> list[Path]:
     """Return regular files ordered by mtime while tolerating concurrent deletion."""
-    candidates: List[tuple[Path, float]] = []
+    candidates: list[tuple[Path, float]] = []
     try:
         for path in directory.glob(pattern):
             try:
@@ -163,9 +164,8 @@ def mask_sensitive_image(image: Any) -> Any:
             width = int(data["width"][index])
             height = int(data["height"][index])
             draw.rectangle((left, top, left + width, top + height), fill="black")
-    except Exception:
-        pass
-    return image
+    except Exception:  # noqa: BLE001
+        return image
 
 
 def append_log(message: str, level: str = "INFO") -> None:
@@ -173,12 +173,11 @@ def append_log(message: str, level: str = "INFO") -> None:
     ensure_app_dirs()
     safe_message = mask_sensitive_text(str(redact_sensitive(message)))
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {safe_message}\n"
-    with _LOG_LOCK:
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+    with _LOG_LOCK, LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
-def _audit_hash(record: Dict[str, Any]) -> str:
+def _audit_hash(record: dict[str, Any]) -> str:
     payload = {key: value for key, value in record.items() if key != "record_hash"}
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -200,7 +199,7 @@ def _last_audit_hash() -> str:
     return AUDIT_GENESIS
 
 
-def append_execution_history(event: str, workflow: Optional["Workflow"] = None, **details: Any) -> None:
+def append_execution_history(event: str, workflow: Workflow | None = None, **details: Any) -> None:
     """Append a privacy-conscious, hash-chained execution event to local JSONL."""
     ensure_app_dirs()
     try:
@@ -209,7 +208,7 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
                 previous = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
                 kept = previous[-MAX_HISTORY_RECORDS_ON_ROTATE:]
                 atomic_write_text(HISTORY_PATH, "\n".join(kept) + ("\n" if kept else ""))
-            record: Dict[str, Any] = {
+            record: dict[str, Any] = {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "event": str(event)[:80],
                 "workflow": workflow.name[:200] if workflow else "",
@@ -229,13 +228,13 @@ def append_execution_history(event: str, workflow: Optional["Workflow"] = None, 
         append_log(f"실행 이력 저장 실패: {exc}", "WARNING")
 
 
-def verify_execution_history(records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def verify_execution_history(records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Verify hash and previous-hash links for retained audit records."""
     items = records if records is not None else read_execution_history(2_000)
-    issues: List[str] = []
+    issues: list[str] = []
     checked = 0
     legacy = 0
-    previous_hash: Optional[str] = None
+    previous_hash: str | None = None
     first_hashed_record = True
     anchored = False
     for index, record in enumerate(items):
@@ -276,7 +275,7 @@ class LocalScheduler:
         self.callback = callback
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self.interval_seconds = 0
 
     @property
@@ -304,12 +303,12 @@ class LocalScheduler:
         if run_immediately:
             try:
                 self.callback()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 append_log(f"예약 실행 콜백 실패: {exc}", "ERROR")
         while not self._stop_event.wait(interval):
             try:
                 self.callback()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 append_log(f"예약 실행 콜백 실패: {exc}", "ERROR")
 
 
@@ -322,7 +321,7 @@ def trim_execution_history(max_bytes: int = MAX_HISTORY_FILE_BYTES) -> None:
             if not HISTORY_PATH.exists() or HISTORY_PATH.stat().st_size <= limit:
                 return
             lines = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-            kept: List[str] = []
+            kept: list[str] = []
             total = 0
             for line in reversed(lines):
                 encoded_size = len((line + "\n").encode("utf-8"))
@@ -336,7 +335,7 @@ def trim_execution_history(max_bytes: int = MAX_HISTORY_FILE_BYTES) -> None:
         append_log(f"실행 이력 정리 실패: {exc}", "WARNING")
 
 
-def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
+def read_execution_history(limit: int = 200) -> list[dict[str, Any]]:
     """Read the newest local execution events without exposing input contents."""
     ensure_app_dirs()
     try:
@@ -345,7 +344,7 @@ def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
         count = 200
     if not HISTORY_PATH.exists():
         return []
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     try:
         with _HISTORY_LOCK:
             lines = HISTORY_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-count:]
@@ -361,7 +360,7 @@ def read_execution_history(limit: int = 200) -> List[Dict[str, Any]]:
     return records
 
 
-def summarize_execution_history(records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def summarize_execution_history(records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Summarize bounded audit records without exposing input contents."""
     items = records if records is not None else read_execution_history(2_000)
     events = Counter(str(item.get("event", "unknown")) for item in items)
@@ -381,9 +380,9 @@ def summarize_execution_history(records: Optional[List[Dict[str, Any]]] = None) 
 MONITOR_SCHEMA_VERSION = 1
 
 
-def evaluate_monitor_alerts(summary: Dict[str, Any], min_runs: int = 3, failure_threshold_percent: float = 50.0) -> List[Dict[str, Any]]:
+def evaluate_monitor_alerts(summary: dict[str, Any], min_runs: int = 3, failure_threshold_percent: float = 50.0) -> list[dict[str, Any]]:
     """Return deterministic local alerts from bounded execution statistics."""
-    alerts: List[Dict[str, Any]] = []
+    alerts: list[dict[str, Any]] = []
     failed = int(summary.get("failed_runs", 0) or 0)
     completed = int(summary.get("completed_runs", 0) or 0)
     runs = failed + completed
@@ -397,7 +396,7 @@ def evaluate_monitor_alerts(summary: Dict[str, Any], min_runs: int = 3, failure_
     return alerts
 
 
-def evaluate_scheduler_health(records: Optional[List[Dict[str, Any]]] = None, window: int = 5, failure_threshold: int = 3) -> Dict[str, Any]:
+def evaluate_scheduler_health(records: list[dict[str, Any]] | None = None, window: int = 5, failure_threshold: int = 3) -> dict[str, Any]:
     """Return a deterministic circuit-breaker state for scheduled playback."""
     items = records if records is not None else read_execution_history(2_000)
     scheduled = [
@@ -421,7 +420,7 @@ def evaluate_scheduler_health(records: Optional[List[Dict[str, Any]]] = None, wi
     }
 
 
-def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] = None, scheduler_running: bool = False, current_step: Optional[int] = None) -> Dict[str, Any]:
+def build_monitor_snapshot(status: str = "idle", workflow: Workflow | None = None, scheduler_running: bool = False, current_step: int | None = None) -> dict[str, Any]:
     """Build a privacy-conscious operational snapshot without steps or input values."""
     records = read_execution_history(2_000)
     summary = summarize_execution_history(records)
@@ -450,7 +449,7 @@ def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] 
     })
 
 
-def write_monitor_snapshot(snapshot: Dict[str, Any]) -> Path:
+def write_monitor_snapshot(snapshot: dict[str, Any]) -> Path:
     """Atomically persist the latest local monitor snapshot."""
     ensure_app_dirs()
     payload = redact_sensitive(dict(snapshot))
@@ -460,7 +459,7 @@ def write_monitor_snapshot(snapshot: Dict[str, Any]) -> Path:
     return MONITOR_STATE_PATH
 
 
-def read_monitor_snapshot() -> Optional[Dict[str, Any]]:
+def read_monitor_snapshot() -> dict[str, Any] | None:
     """Read a local monitor snapshot, rejecting malformed or unsupported state."""
     try:
         with _MONITOR_LOCK:
@@ -504,7 +503,7 @@ def export_support_bundle(target: Path) -> Path:
 def write_execution_report(
     run_id: str,
     event: str,
-    workflow: Optional["Workflow"] = None,
+    workflow: Workflow | None = None,
     *,
     mode: str = "playback",
     start_step: int = 0,
@@ -512,7 +511,7 @@ def write_execution_report(
     duration_seconds: float = 0.0,
     error_type: str = "",
     policy_profile: str = "",
-) -> Optional[Path]:
+) -> Path | None:
     """Write a bounded, privacy-conscious per-run report without workflow inputs."""
     ensure_app_dirs()
     safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "", str(run_id))[:40] or "unknown"
@@ -549,14 +548,14 @@ def write_execution_report(
         return None
 
 
-def read_execution_reports(limit: int = 100) -> List[Dict[str, Any]]:
+def read_execution_reports(limit: int = 100) -> list[dict[str, Any]]:
     """Read bounded local execution summaries using a strict non-sensitive field allowlist."""
     ensure_app_dirs()
     try:
         count = max(1, min(int(limit), MAX_RUN_REPORTS))
     except (TypeError, ValueError):
         count = MAX_RUN_REPORTS
-    reports: List[Dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
     fields = (
         "version", "created_at", "run_id", "event", "mode", "workflow", "step_count",
         "start_step", "last_step", "duration_seconds", "error_type", "policy_profile",
@@ -574,7 +573,7 @@ def read_execution_reports(limit: int = 100) -> List[Dict[str, Any]]:
     return reports
 
 
-def _summarize_report_group(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _summarize_report_group(items: list[dict[str, Any]]) -> dict[str, Any]:
     completed_events = {"playback_completed", "ai_plan_completed", "ai_plan_dry_run_completed"}
     failed_events = [item for item in items if str(item.get("event", "")).endswith("_failed")]
     completed = sum(1 for item in items if item.get("event") in completed_events)
@@ -590,15 +589,15 @@ def _summarize_report_group(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def summarize_execution_reports(reports: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Summarize terminal reports, policy/date trends, and bounded failure patterns."""
     items = reports if reports is not None else read_execution_reports(MAX_RUN_REPORTS)
     base = _summarize_report_group(items)
     failed_events = [item for item in items if str(item.get("event", "")).endswith("_failed")]
     error_counts = Counter(str(item.get("error_type", "")).strip() for item in failed_events if str(item.get("error_type", "")).strip())
     workflow_counts = Counter(str(item.get("workflow", "")).strip() for item in failed_events if str(item.get("workflow", "")).strip())
-    policy_groups: Dict[str, List[Dict[str, Any]]] = {}
-    date_groups: Dict[str, List[Dict[str, Any]]] = {}
+    policy_groups: dict[str, list[dict[str, Any]]] = {}
+    date_groups: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         policy = str(item.get("policy_profile", "")).strip() or "unknown"
         policy_groups.setdefault(policy, []).append(item)
@@ -623,7 +622,7 @@ def summarize_execution_reports(reports: Optional[List[Dict[str, Any]]] = None) 
     }
 
 
-def build_execution_report_dashboard(limit: int = 20) -> Dict[str, Any]:
+def build_execution_report_dashboard(limit: int = 20) -> dict[str, Any]:
     """Build a local dashboard payload containing only report summaries and recent safe fields."""
     reports = read_execution_reports(MAX_RUN_REPORTS)
     try:
@@ -694,7 +693,7 @@ def save_execution_checkpoint(workflow_path: Path | None, next_index: int, workf
         append_log(f"실행 체크포인트 저장 실패: {exc}", "WARNING")
 
 
-def load_execution_checkpoint() -> Optional[Dict[str, Any]]:
+def load_execution_checkpoint() -> dict[str, Any] | None:
     """Load and validate resumable metadata, returning None for stale/corrupt state."""
     if not CHECKPOINT_PATH.exists():
         return None
@@ -726,12 +725,12 @@ def clear_execution_checkpoint() -> None:
         append_log(f"실행 체크포인트 삭제 실패: {exc}", "WARNING")
 
 
-def write_error_report(context: Dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: Optional[str] = None, mask_sensitive: bool = True) -> Path:
+def write_error_report(context: dict[str, Any], exc: BaseException, capture_screen: bool = False, traceback_text: str | None = None, mask_sensitive: bool = True) -> Path:
     """Write a local JSON error report and optionally a screen snapshot."""
     ensure_app_dirs()
     stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns()}"
     report_path = ERROR_DIR / f"error_{stamp}.json"
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "context": redact_sensitive(context),
         "error_type": type(exc).__name__,
@@ -748,7 +747,7 @@ def write_error_report(context: Dict[str, Any], exc: BaseException, capture_scre
             image.save(buffer, format="PNG")
             atomic_write_bytes(image_path, buffer.getvalue())
             report["screen_snapshot"] = str(image_path)
-        except Exception as snapshot_exc:
+        except Exception as snapshot_exc:  # noqa: BLE001
             report["screen_snapshot_error"] = mask_sensitive_text(str(snapshot_exc)[:1000])
     atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
     append_log(f"오류 보고서 생성: {report_path} · {type(exc).__name__}: {str(exc)[:500]}", "ERROR")
@@ -793,9 +792,9 @@ def validate_timeout(value: Any) -> int:
     return timeout
 
 
-def validate_runtime_config(data: Any, defaults: Optional[Dict[str, Any]] = None) -> tuple[Dict[str, Any], List[str]]:
+def validate_runtime_config(data: Any, defaults: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
     """Return a bounded local configuration and fields that were reset after validation."""
-    safe_defaults: Dict[str, Any] = {
+    safe_defaults: dict[str, Any] = {
         "endpoint": "http://127.0.0.1:11434/v1",
         "model": "gemma4:e2b",
         "timeout": 120,
@@ -809,7 +808,7 @@ def validate_runtime_config(data: Any, defaults: Optional[Dict[str, Any]] = None
         safe_defaults.update(defaults)
     raw = data if isinstance(data, dict) else {}
     result = dict(safe_defaults)
-    reset_fields: List[str] = []
+    reset_fields: list[str] = []
 
     try:
         result["endpoint"] = validate_local_endpoint(raw.get("endpoint", safe_defaults["endpoint"]))
@@ -847,10 +846,10 @@ def validate_runtime_config(data: Any, defaults: Optional[Dict[str, Any]] = None
     return result, reset_fields
 
 
-def load_runtime_config(path: Path, defaults: Optional[Dict[str, Any]] = None) -> tuple[Dict[str, Any], List[str]]:
+def load_runtime_config(path: Path, defaults: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
     """Load a bounded JSON config and return safe values plus reset reasons."""
-    data: Dict[str, Any] = {}
-    reset_fields: List[str] = []
+    data: dict[str, Any] = {}
+    reset_fields: list[str] = []
     try:
         config_path = Path(path)
         if config_path.exists():
@@ -880,8 +879,8 @@ class ObservedElement(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     enabled: bool = True
     visible: bool = True
-    automation_id: Optional[str] = None
-    control_type: Optional[str] = None
+    automation_id: str | None = None
+    control_type: str | None = None
 
 
 class UIAction(BaseModel):
@@ -890,8 +889,8 @@ class UIAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["click", "double_click", "type", "hotkey", "scroll", "wait", "none"]
-    element_id: Optional[str] = None
-    text: Optional[str] = None
+    element_id: str | None = None
+    text: str | None = None
     keys: list[str] = Field(default_factory=list)
     amount: int = Field(default=0, ge=-5, le=5)
     seconds: float = Field(default=0.0, ge=0.0, le=60.0)
@@ -900,9 +899,9 @@ class UIAction(BaseModel):
     requires_confirmation: bool = True
     reason: str = ""
     expected_texts: list[str] = Field(default_factory=list)
-    element_role: Optional[str] = None
-    element_name: Optional[str] = None
-    element_control_type: Optional[str] = None
+    element_role: str | None = None
+    element_name: str | None = None
+    element_control_type: str | None = None
 
 
 class AutomationPlan(BaseModel):
@@ -927,27 +926,27 @@ class Step:
 
     type: str
     delay: float = 0.0
-    x: Optional[int] = None
-    y: Optional[int] = None
-    button: Optional[str] = None
-    event: Optional[str] = None
-    kind: Optional[str] = None
-    value: Optional[str] = None
-    uia_automation_id: Optional[str] = None
-    uia_name: Optional[str] = None
-    uia_control_type: Optional[str] = None
-    window_title: Optional[str] = None
+    x: int | None = None
+    y: int | None = None
+    button: str | None = None
+    event: str | None = None
+    kind: str | None = None
+    value: str | None = None
+    uia_automation_id: str | None = None
+    uia_name: str | None = None
+    uia_control_type: str | None = None
+    window_title: str | None = None
 
 
 @dataclass
 class Workflow:
     name: str = "새 작업"
     description: str = ""
-    steps: List[Step] = field(default_factory=list)
-    recorded_screen_size: Optional[List[int]] = None
-    signature: Optional[str] = None
+    steps: list[Step] = field(default_factory=list)
+    recorded_screen_size: list[int] | None = None
+    signature: str | None = None
 
-    def to_dict(self, include_signature: bool = True) -> Dict[str, Any]:
+    def to_dict(self, include_signature: bool = True) -> dict[str, Any]:
         payload = {
             "version": WORKFLOW_VERSION,
             "name": self.name[:200],
@@ -960,18 +959,18 @@ class Workflow:
         return payload
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Workflow":
+    def from_dict(cls, data: dict[str, Any]) -> Workflow:
         if not isinstance(data, dict):
-            raise ValueError("작업 파일의 최상위 형식은 JSON 객체여야 합니다.")
+            raise TypeError("작업 파일의 최상위 형식은 JSON 객체여야 합니다.")
         version = data.get("version", 1)
         if version not in {1, WORKFLOW_VERSION}:
             raise ValueError(f"지원하지 않는 작업 파일 버전입니다: {version}")
         raw_steps = data.get("steps", [])
         if not isinstance(raw_steps, list):
-            raise ValueError("작업 단계는 배열이어야 합니다.")
+            raise TypeError("작업 단계는 배열이어야 합니다.")
         if len(raw_steps) > MAX_WORKFLOW_STEPS:
             raise ValueError(f"작업 단계는 최대 {MAX_WORKFLOW_STEPS:,}개까지 허용됩니다.")
-        steps: List[Step] = []
+        steps: list[Step] = []
         allowed_types = {"click", "key", "wait"}
         allowed_buttons = {"left", "right", "middle", "x1", "x2"}
         allowed_fields = set(Step.__dataclass_fields__)
@@ -1021,7 +1020,7 @@ class Workflow:
         if signature is not None and (not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature)):
             raise ValueError("작업 파일 서명이 올바르지 않습니다.")
         if not isinstance(name, str) or not isinstance(description, str):
-            raise ValueError("작업 이름과 설명은 문자열이어야 합니다.")
+            raise TypeError("작업 이름과 설명은 문자열이어야 합니다.")
         if recorded_screen_size is not None:
             if not isinstance(recorded_screen_size, (list, tuple)) or len(recorded_screen_size) != 2:
                 raise ValueError("기록 당시 화면 크기 정보가 올바르지 않습니다.")
@@ -1084,16 +1083,16 @@ def get_active_window_title() -> str:
     try:
         from pywinauto import Desktop
         return str(Desktop(backend="uia").get_active().window_text() or "")[:512]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
-def get_uia_metadata_at_point(x: int, y: int) -> Dict[str, str]:
+def get_uia_metadata_at_point(x: int, y: int) -> dict[str, str]:
     """Best-effort metadata lookup for a recorded click point."""
     try:
         from pywinauto import Desktop
         active = Desktop(backend="uia").get_active()
-        candidates: List[tuple[int, Dict[str, str]]] = []
+        candidates: list[tuple[int, dict[str, str]]] = []
         for control in active.descendants()[:200]:
             try:
                 rect = control.rectangle()
@@ -1110,14 +1109,13 @@ def get_uia_metadata_at_point(x: int, y: int) -> Dict[str, str]:
                         "uia_name": name or None,
                         "uia_control_type": control_type or None,
                     }))
-            except Exception:
+            except Exception:  # noqa: BLE001, S112
                 continue
         if candidates:
             candidates.sort(key=lambda item: item[0])
             return candidates[0][1]
-    except Exception:
-        pass
-    return {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _workflow_canonical_bytes(workflow: Workflow) -> bytes:
@@ -1165,10 +1163,10 @@ def verify_workflow_signature(workflow: Workflow) -> bool:
 class InputRecorder:
     """Records mouse clicks and keyboard press/release events globally."""
 
-    def __init__(self, on_step: Optional[Callable[[Step], None]] = None, on_error: Optional[Callable[[BaseException], None]] = None):
+    def __init__(self, on_step: Callable[[Step], None] | None = None, on_error: Callable[[BaseException], None] | None = None):
         self.on_step = on_step
         self.on_error = on_error
-        self.steps: List[Step] = []
+        self.steps: list[Step] = []
         self._mouse_listener = None
         self._keyboard_listener = None
         self._running = False
@@ -1201,7 +1199,7 @@ class InputRecorder:
         if self.on_step:
             try:
                 self.on_step(step)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.stop()
                 if self.on_error:
                     self.on_error(exc)
@@ -1230,8 +1228,8 @@ class InputRecorder:
             if listener is not None:
                 try:
                     listener.stop()
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001, S112
+                    continue
         self._mouse_listener = None
         self._keyboard_listener = None
 
@@ -1257,8 +1255,8 @@ class InputRecorder:
 class WorkflowPlayer:
     """Replays a workflow and can be interrupted by a stop event."""
 
-    BUTTONS = {"left", "right", "middle", "x1", "x2"}
-    KEY_ALIASES = {
+    BUTTONS: ClassVar[set[str]] = {"left", "right", "middle", "x1", "x2"}
+    KEY_ALIASES: ClassVar[dict[str, str]] = {
         "ctrl_l": "ctrl", "ctrl_r": "ctrl", "shift": "shift", "shift_l": "shift", "shift_r": "shift",
         "alt_l": "alt", "alt_r": "alt", "cmd": "win", "cmd_l": "win", "cmd_r": "win",
         "space": "space", "enter": "enter", "tab": "tab", "backspace": "backspace",
@@ -1267,7 +1265,7 @@ class WorkflowPlayer:
         "insert": "insert", "caps_lock": "capslock", "num_lock": "numlock", "print_screen": "printscreen",
     }
 
-    def __init__(self, on_step: Optional[Callable[[int, Step], None]] = None, on_status: Optional[Callable[[str], None]] = None, on_error: Optional[Callable[[BaseException, int, Step], None]] = None):
+    def __init__(self, on_step: Callable[[int, Step], None] | None = None, on_status: Callable[[str], None] | None = None, on_error: Callable[[BaseException, int, Step], None] | None = None):
         self.on_step = on_step
         self.on_status = on_status
         self.on_error = on_error
@@ -1275,10 +1273,10 @@ class WorkflowPlayer:
         self.pause_event = threading.Event()
         self.running = False
         self.current_index = 0
-        self.current_step: Optional[Step] = None
-        self.last_error: Optional[BaseException] = None
+        self.current_step: Step | None = None
+        self.last_error: BaseException | None = None
         self._pressed_keys: set[str] = set()
-        self.failed: Optional[BaseException] = None
+        self.failed: BaseException | None = None
         self.failure_index = 0
         self._run_lock = threading.Lock()
 
@@ -1325,16 +1323,16 @@ class WorkflowPlayer:
         previous = None
         try:
             previous = pyperclip.paste()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            previous = None
         pyperclip.copy(text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.03)
         if previous is not None:
             try:
                 pyperclip.copy(previous)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                return
 
     @classmethod
     def _key_name(cls, kind: str, value: str) -> str:
@@ -1366,8 +1364,8 @@ class WorkflowPlayer:
         for key_name in list(self._pressed_keys):
             try:
                 pyautogui.keyUp(key_name)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001, S112
+                continue
         self._pressed_keys.clear()
 
     @staticmethod
@@ -1414,7 +1412,7 @@ class WorkflowPlayer:
                     if rect.right <= rect.left or rect.bottom <= rect.top:
                         continue
                     candidates.append((rect, control_type, name))
-                except Exception:
+                except Exception:  # noqa: BLE001, S112
                     continue
             if len(candidates) == 1:
                 rect = candidates[0][0]
@@ -1537,7 +1535,7 @@ def validate_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = 
     return True, "검증 완료"
 
 
-def resolve_observed_element(action: UIAction, observation: Dict[str, Any]) -> Optional[ObservedElement]:
+def resolve_observed_element(action: UIAction, observation: dict[str, Any]) -> ObservedElement | None:
     """Resolve an AI action to one current element, allowing safe semantic re-binding."""
     try:
         elements = [ObservedElement.model_validate(item) for item in observation.get("elements", [])]
@@ -1558,13 +1556,13 @@ def resolve_observed_element(action: UIAction, observation: Dict[str, Any]) -> O
     return candidates[0] if len(candidates) == 1 else None
 
 
-def inspect_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> Dict[str, Any]:
+def inspect_workflow(workflow: Workflow, screen_size: tuple[int, int] | None = None) -> dict[str, Any]:
     """Return a non-destructive safety and readiness report for a workflow."""
     valid, reason = validate_workflow(workflow, screen_size)
     steps = list(workflow.steps) if isinstance(workflow, Workflow) else []
     current_size = tuple(int(value) for value in screen_size) if screen_size else None
     recorded_size = tuple(workflow.recorded_screen_size) if isinstance(workflow, Workflow) and workflow.recorded_screen_size else None
-    warnings: List[str] = []
+    warnings: list[str] = []
     if recorded_size and current_size and recorded_size != current_size:
         warnings.append(f"기록 화면 {recorded_size[0]}×{recorded_size[1]}와 현재 화면 {current_size[0]}×{current_size[1]}이 다릅니다.")
     window_titles = list(dict.fromkeys(step.window_title.strip() for step in steps if (step.window_title or "").strip()))
@@ -1605,7 +1603,7 @@ def ensure_app_dirs() -> None:
     RUN_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_screen_size() -> Optional[tuple[int, int]]:
+def get_screen_size() -> tuple[int, int] | None:
     """Return the current primary screen size when the GUI backend is available."""
     if pyautogui is None:
         return None
@@ -1617,7 +1615,7 @@ def get_screen_size() -> Optional[tuple[int, int]]:
     return (width, height) if width > 0 and height > 0 else None
 
 
-def capture_observation() -> Dict[str, Any]:
+def capture_observation() -> dict[str, Any]:
     """Capture the screen and best-effort active-window/OCR context."""
     ensure_app_dirs()
     if pyautogui is None:
@@ -1627,8 +1625,8 @@ def capture_observation() -> Dict[str, Any]:
     image.save(image_path)
 
     active_window = ""
-    ui_controls: List[Dict[str, Any]] = []
-    element_records: List[Dict[str, Any]] = []
+    ui_controls: list[dict[str, Any]] = []
+    element_records: list[dict[str, Any]] = []
     try:
         from pywinauto import Desktop
         active = Desktop(backend="uia").get_active()
@@ -1668,22 +1666,25 @@ def capture_observation() -> Dict[str, Any]:
                         "control_type": control_type,
                         "rectangle": bbox,
                     })
-            except Exception:
+            except Exception:  # noqa: BLE001, S112
                 continue
-    except Exception:
+    except Exception:  # noqa: BLE001
         active_window = ""
 
     ocr_text = ""
     try:
         import pytesseract
         ocr_text = mask_sensitive_text(pytesseract.image_to_string(image, lang="kor+eng"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         ocr_text = "OCR을 사용할 수 없습니다. Windows에 Tesseract와 kor+eng 언어 데이터를 설치하면 화면 문자를 읽을 수 있습니다."
 
     try:
         from adapters import build_adapter_context, build_read_only_adapter_validation
     except ImportError:  # package import path for tests and embedded use
-        from app.adapters import build_adapter_context, build_read_only_adapter_validation
+        from app.adapters import (
+            build_adapter_context,
+            build_read_only_adapter_validation,
+        )
     application_context = build_adapter_context(active_window, ocr_text)
     adapter_validation = build_read_only_adapter_validation(active_window, ocr_text)
 
@@ -1712,7 +1713,7 @@ class LocalAIClient:
         self.timeout = validate_timeout(timeout)
         self.vision = vision
 
-    def health_check(self) -> Dict[str, Any]:
+    def health_check(self) -> dict[str, Any]:
         """Check the local OpenAI-compatible server without sending user data."""
         import requests
 
@@ -1735,7 +1736,7 @@ class LocalAIClient:
         return f"data:image/png;base64,{encoded}"
 
     @staticmethod
-    def _extract_content(response: Dict[str, Any]) -> str:
+    def _extract_content(response: dict[str, Any]) -> str:
         choices = response.get("choices") or []
         if not choices:
             raise RuntimeError("로컬 AI 서버 응답에 choices가 없습니다.")
@@ -1746,15 +1747,15 @@ class LocalAIClient:
         return str(content)
 
     @staticmethod
-    def _parse_json(text: str) -> Dict[str, Any]:
+    def _parse_json(text: str) -> dict[str, Any]:
         cleaned = text.strip()
         if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\s*```$", "", cleaned)
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, flags=re.S)
+            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
             if not match:
                 return {"summary": cleaned, "risk": "high", "steps": []}
             try:
@@ -1765,13 +1766,13 @@ class LocalAIClient:
             return {"summary": str(data), "risk": "high", "steps": []}
         return data
 
-    def make_recovery_plan(self, failure_context: Dict[str, Any], observation: Dict[str, Any]) -> Dict[str, Any]:
+    def make_recovery_plan(self, failure_context: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
         """Generate a conservative recovery proposal; never execute it automatically."""
         enriched = dict(observation)
         enriched["recovery_context"] = redact_sensitive(failure_context)
         return self.make_plan("실패 원인을 분석하고, 위험 동작 없이 사용자가 검토할 복구 계획을 제안해 줘", enriched)
 
-    def make_plan(self, goal: str, observation: Dict[str, Any]) -> Dict[str, Any]:
+    def make_plan(self, goal: str, observation: dict[str, Any]) -> dict[str, Any]:
         import requests
 
         goal = (goal or "").strip()
@@ -1858,7 +1859,7 @@ def cleanup_workflow_backups(max_backups: int = MAX_WORKFLOW_BACKUPS) -> None:
         return
 
 
-def backup_workflow(path: Path) -> Optional[Path]:
+def backup_workflow(path: Path) -> Path | None:
     """Create a timestamped local backup before an existing workflow is overwritten."""
     source = Path(path)
     if not source.exists() or not source.is_file():
@@ -1872,7 +1873,7 @@ def backup_workflow(path: Path) -> Optional[Path]:
     return target
 
 
-def list_workflow_backups(workflow_path: Path | None = None) -> List[Path]:
+def list_workflow_backups(workflow_path: Path | None = None) -> list[Path]:
     """List newest local workflow backups, optionally filtered by original stem."""
     ensure_app_dirs()
     stem = Path(workflow_path).stem if workflow_path else None
@@ -1880,7 +1881,7 @@ def list_workflow_backups(workflow_path: Path | None = None) -> List[Path]:
     return paths
 
 
-def save_workflow(workflow: Workflow, path: Path) -> Optional[Path]:
+def save_workflow(workflow: Workflow, path: Path) -> Path | None:
     ensure_app_dirs()
     if not isinstance(workflow, Workflow):
         raise TypeError("Workflow 객체만 저장할 수 있습니다.")
@@ -1903,7 +1904,7 @@ MAX_PROMPT_TEMPLATE_LENGTH = 4_000
 MAX_PROMPT_TEMPLATE_VERSIONS = 20
 
 
-def _prompt_template_fingerprint(data: Dict[str, Any]) -> str:
+def _prompt_template_fingerprint(data: dict[str, Any]) -> str:
     """Hash only normalized template semantics, excluding timestamps and revision metadata."""
     normalized = {
         "version": PROMPT_TEMPLATE_VERSION,
@@ -1921,14 +1922,14 @@ def _prompt_template_history_dir(path: Path) -> Path:
     return target.parent / f".{target.stem}.versions"
 
 
-def _prompt_template_revision(data: Dict[str, Any]) -> int:
+def _prompt_template_revision(data: dict[str, Any]) -> int:
     try:
         return max(1, int(data.get("revision", 1) or 1))
     except (TypeError, ValueError):
         return 1
 
 
-def save_prompt_template(path: Path, name: str, goal_template: str, policy_profile: str = "standard", document_roots: list[str] | None = None) -> Dict[str, Any]:
+def save_prompt_template(path: Path, name: str, goal_template: str, policy_profile: str = "standard", document_roots: list[str] | None = None) -> dict[str, Any]:
     """Persist a versioned natural-language task template locally and atomically."""
     title = (name or "자연어 작업 템플릿").strip()[:200]
     template = (goal_template or "").strip()
@@ -1937,7 +1938,7 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
     placeholders = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", template)))[:30]
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "version": PROMPT_TEMPLATE_VERSION,
         "name": title,
         "goal_template": template,
@@ -1946,7 +1947,7 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
         "document_roots": [str(item)[:500] for item in (document_roots or [])[:5]],
     }
     payload["fingerprint"] = _prompt_template_fingerprint(payload)
-    previous: Optional[Dict[str, Any]] = None
+    previous: dict[str, Any] | None = None
     if target.exists():
         try:
             previous = load_prompt_template(target)
@@ -1974,7 +1975,7 @@ def save_prompt_template(path: Path, name: str, goal_template: str, policy_profi
     return payload
 
 
-def load_prompt_template(path: Path) -> Dict[str, Any]:
+def load_prompt_template(path: Path) -> dict[str, Any]:
     """Load and validate a natural-language task template."""
     target = Path(path)
     if target.stat().st_size > 256 * 1024:
@@ -2003,7 +2004,7 @@ def load_prompt_template(path: Path) -> Dict[str, Any]:
     return data
 
 
-def _prompt_template_summary(data: Dict[str, Any], is_current: bool = False) -> Dict[str, Any]:
+def _prompt_template_summary(data: dict[str, Any], is_current: bool = False) -> dict[str, Any]:
     return {
         "revision": _prompt_template_revision(data),
         "name": str(data.get("name", ""))[:200],
@@ -2014,7 +2015,7 @@ def _prompt_template_summary(data: Dict[str, Any], is_current: bool = False) -> 
     }
 
 
-def list_prompt_template_versions(path: Path) -> list[Dict[str, Any]]:
+def list_prompt_template_versions(path: Path) -> list[dict[str, Any]]:
     """List local template revision metadata without returning goal text or document roots."""
     target = Path(path)
     current = load_prompt_template(target)
@@ -2029,7 +2030,7 @@ def list_prompt_template_versions(path: Path) -> list[Dict[str, Any]]:
     return versions[:MAX_PROMPT_TEMPLATE_VERSIONS + 1]
 
 
-def load_prompt_template_version(path: Path, revision: int) -> Dict[str, Any]:
+def load_prompt_template_version(path: Path, revision: int) -> dict[str, Any]:
     """Load one local template revision, failing closed when the revision is absent."""
     target = Path(path)
     current = load_prompt_template(target)
@@ -2042,7 +2043,7 @@ def load_prompt_template_version(path: Path, revision: int) -> Dict[str, Any]:
     return load_prompt_template(archive)
 
 
-def _compare_prompt_template_data(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+def _compare_prompt_template_data(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     changed = []
     for field_name in ("name", "goal_template", "placeholders", "policy_profile", "document_roots"):
         if left.get(field_name) != right.get(field_name):
@@ -2055,19 +2056,19 @@ def _compare_prompt_template_data(left: Dict[str, Any], right: Dict[str, Any]) -
     }
 
 
-def compare_prompt_templates(left_path: Path, right_path: Path) -> Dict[str, Any]:
+def compare_prompt_templates(left_path: Path, right_path: Path) -> dict[str, Any]:
     """Compare two local templates by metadata and semantic fields without emitting their text."""
     return _compare_prompt_template_data(load_prompt_template(Path(left_path)), load_prompt_template(Path(right_path)))
 
 
-def compare_prompt_template_versions(path: Path, left_revision: int, right_revision: int) -> Dict[str, Any]:
+def compare_prompt_template_versions(path: Path, left_revision: int, right_revision: int) -> dict[str, Any]:
     """Compare two revisions of one local template without returning goal text."""
     left = load_prompt_template_version(path, left_revision)
     right = load_prompt_template_version(path, right_revision)
     return _compare_prompt_template_data(left, right)
 
 
-def render_prompt_template(template: str, values: Dict[str, Any]) -> str:
+def render_prompt_template(template: str, values: dict[str, Any]) -> str:
     """Render explicit double-brace variables and fail closed on missing values."""
     text = str(template or "")
     names = sorted(set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", text)))
@@ -2098,9 +2099,9 @@ def load_workflow(path: Path, require_signature: bool = False) -> Workflow:
 
 
 def validate_ai_steps(
-    plan: Dict[str, Any],
+    plan: dict[str, Any],
     screen_size: tuple[int, int] | None = None,
-    observation: Dict[str, Any] | None = None,
+    observation: dict[str, Any] | None = None,
     policy_profile: str = "standard",
 ) -> tuple[bool, str]:
     """Validate a plan against the current screen elements; direct coordinates are rejected."""

@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 REQUIRED_FILES = (
     "README.md",
     "SECURITY_OFFLINE.md",
@@ -107,4 +106,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["validate_release_layout", "main"]
+__all__ = ["main", "validate_release_layout"]

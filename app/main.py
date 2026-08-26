@@ -9,84 +9,85 @@ import tkinter as tk
 import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any, Dict, Optional
+from typing import Any
 
 from engine import (
     APP_DIR,
     BACKUP_DIR,
     CONFIG_PATH,
     ERROR_DIR,
-    TEMPLATE_DIR,
     LOG_PATH,
+    TEMPLATE_DIR,
     WORKFLOW_DIR,
     InputRecorder,
     LocalAIClient,
     LocalScheduler,
     RetryableAutomationError,
-    UserInterventionRequired,
     Step,
+    UserInterventionRequired,
     Workflow,
-    get_screen_size,
     WorkflowPlayer,
+    append_execution_history,
     append_log,
     atomic_write_text,
-    append_execution_history,
     build_execution_report_dashboard,
-    export_execution_report_summary,
-    compare_prompt_templates,
-    list_prompt_template_versions,
-    write_execution_report,
-    read_execution_history,
-    summarize_execution_history,
     build_monitor_snapshot,
-    write_monitor_snapshot,
-    export_support_bundle,
     capture_observation,
     cleanup_expired_artifacts,
-    ensure_app_dirs,
-    redact_sensitive,
-    inspect_workflow,
-    validate_workflow,
-    verify_workflow_signature,
-    verify_execution_history,
-    evaluate_scheduler_health,
-    write_error_report,
-    load_workflow,
-    save_workflow,
-    save_execution_checkpoint,
-    load_execution_checkpoint,
     clear_execution_checkpoint,
+    compare_prompt_templates,
+    ensure_app_dirs,
+    evaluate_scheduler_health,
+    export_execution_report_summary,
+    export_support_bundle,
+    get_screen_size,
+    inspect_workflow,
+    list_prompt_template_versions,
+    load_execution_checkpoint,
+    load_prompt_template,
+    load_runtime_config,
+    load_workflow,
+    read_execution_history,
+    redact_sensitive,
+    render_prompt_template,
+    save_execution_checkpoint,
+    save_prompt_template,
+    save_workflow,
+    summarize_execution_history,
     validate_ai_steps,
     validate_local_endpoint,
-    validate_timeout,
-    load_runtime_config,
     validate_schedule_interval,
-    save_prompt_template,
-    load_prompt_template,
-    render_prompt_template,
+    validate_timeout,
+    validate_workflow,
+    verify_execution_history,
+    verify_workflow_signature,
+    write_error_report,
+    write_execution_report,
+    write_monitor_snapshot,
 )
+
 try:
     from adapters import build_document_context, normalize_document_roots
 except ImportError:
     from app.adapters import build_document_context, normalize_document_roots
 try:
-    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, review_plan
+    from policies import DEFAULT_POLICY_PROFILE, POLICY_PROFILES, review_plan
 except ImportError:
-    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, review_plan
+    from app.policies import DEFAULT_POLICY_PROFILE, POLICY_PROFILES, review_plan
 
 try:
     import pyautogui
-except Exception:
+except (Exception, SystemExit):  # noqa: BLE001
     pyautogui = None
 
 try:
     import pyperclip
-except Exception:
+except (Exception, SystemExit):  # noqa: BLE001
     pyperclip = None
 
 try:
     from pynput import keyboard as pynput_keyboard
-except Exception:
+except (Exception, SystemExit):  # noqa: BLE001
     pynput_keyboard = None
 
 
@@ -102,9 +103,9 @@ class AutoWorkAgent(tk.Tk):
         self.configure(bg="#f4f6f8")
 
         self.workflow = Workflow()
-        self.current_path: Optional[Path] = None
-        self.last_observation: Optional[Dict[str, Any]] = None
-        self.last_plan: Optional[Dict[str, Any]] = None
+        self.current_path: Path | None = None
+        self.last_observation: dict[str, Any] | None = None
+        self.last_plan: dict[str, Any] | None = None
         self.recording = False
         self.hotkey_listener = None
         self.ai_stop_event = threading.Event()
@@ -113,7 +114,7 @@ class AutoWorkAgent(tk.Tk):
         self._playback_launch_lock = threading.Lock()
         self._step_gate = threading.Event()
         self.step_mode_enabled = False
-        self.last_failed_step_index: Optional[int] = None
+        self.last_failed_step_index: int | None = None
         self.last_ai_index = 0
         self.last_ai_run_id = ""
         self.dry_run_enabled = True
@@ -397,7 +398,7 @@ class AutoWorkAgent(tk.Tk):
                 text = "\n".join(lines) or "로그가 아직 없습니다."
             else:
                 text = "로그가 아직 없습니다."
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             text = f"로그를 읽을 수 없습니다: {exc}"
         self._set_text(self.log_text, text)
 
@@ -410,7 +411,7 @@ class AutoWorkAgent(tk.Tk):
             success_rate = "-" if summary["success_rate"] is None else f"{summary['success_rate']:.1f}%"
             header = f"통계 · 이벤트 {summary['total_events']} · 완료 {summary['completed_runs']} · 실패 {summary['failed_runs']} · 성공률 {success_rate} · 마지막 이벤트 {summary['last_event'] or '-'}"
             text = header + "\n\n" + ("\n".join(json.dumps(record, ensure_ascii=False) for record in records) or "실행 이력이 아직 없습니다.")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             text = f"실행 이력을 읽을 수 없습니다: {exc}"
         self._set_text(self.history_text, text)
 
@@ -430,8 +431,10 @@ class AutoWorkAgent(tk.Tk):
             policy_text = ", ".join(f"{item.get('policy_profile')}: {item.get('success_rate', '-')}%" for item in policy_stats) or "없음"
             trend_text = ", ".join(f"{item.get('date')}: {item.get('success_rate', '-')}%" for item in daily_trend) or "없음"
             lines = [
-                f"요약 · 리포트 {summary.get('total_reports', 0)} · 완료 {summary.get('completed_runs', 0)} · "
-                f"실패 {summary.get('failed_runs', 0)} · 중지 {summary.get('stopped_runs', 0)} · 성공률 {success_rate}",
+                (
+                    f"요약 · 리포트 {summary.get('total_reports', 0)} · 완료 {summary.get('completed_runs', 0)} · "
+                    f"실패 {summary.get('failed_runs', 0)} · 중지 {summary.get('stopped_runs', 0)} · 성공률 {success_rate}"
+                ),
                 f"주요 오류 유형: {failure_text}",
                 f"실패 작업: {workflow_text}",
                 f"정책별 성공률: {policy_text}",
@@ -443,10 +446,10 @@ class AutoWorkAgent(tk.Tk):
             for report in dashboard.get("recent_reports", []):
                 lines.append(json.dumps({field_name: report.get(field_name) for field_name in safe_fields}, ensure_ascii=False))
             self._set_text(self.report_text, "\n".join(lines))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._set_text(self.report_text, f"실행 리포트를 읽을 수 없습니다: {exc}")
 
-    def _refresh_monitor_view(self, status_override: Optional[str] = None) -> None:
+    def _refresh_monitor_view(self, status_override: str | None = None) -> None:
         if not hasattr(self, "monitor_status_var"):
             return
         try:
@@ -469,7 +472,7 @@ class AutoWorkAgent(tk.Tk):
                 f"성공률 {summary.get('success_rate', '-')} · 감사 {integrity_text} · "
                 f"경보 {len(alerts)}개 · {alert_text}"
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.monitor_status_var.set(f"운영 모니터 오류: {exc}")
 
     def _monitor_heartbeat(self) -> None:
@@ -499,7 +502,7 @@ class AutoWorkAgent(tk.Tk):
             append_execution_history("execution_report_summary_exported", self.workflow, period_days=period_days, size_bytes=summary_path.stat().st_size)
             self._set_status(f"실행 리포트 요약 export 완료 · {summary_path.name}")
             messagebox.showinfo("리포트 export 완료", f"입력값과 Workflow 단계 원문을 제외한 요약을 저장했습니다.\n\n{summary_path}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("실행 리포트 export 실패", str(exc))
 
     def _export_support_bundle(self) -> None:
@@ -517,7 +520,7 @@ class AutoWorkAgent(tk.Tk):
             append_execution_history("support_bundle_exported", self.workflow, size_bytes=bundle_path.stat().st_size)
             self._set_status(f"지원 진단 패키지 저장 완료 · {bundle_path.name}")
             messagebox.showinfo("지원 패키지 저장 완료", f"민감한 Workflow 단계와 화면 원문을 제외한 진단 패키지를 저장했습니다.\n\n{bundle_path}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("지원 패키지 저장 실패", str(exc))
 
     def _open_log_folder(self) -> None:
@@ -526,11 +529,11 @@ class AutoWorkAgent(tk.Tk):
                 os.startfile(str(APP_DIR))
             else:
                 messagebox.showinfo("로그 위치", str(APP_DIR))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("로그 폴더 열기 실패", str(exc))
 
-    def _handle_exception(self, component: str, exc: BaseException, extra: Optional[Dict[str, Any]] = None) -> Optional[Path]:
-        context: Dict[str, Any] = {
+    def _handle_exception(self, component: str, exc: BaseException, extra: dict[str, Any] | None = None) -> Path | None:
+        context: dict[str, Any] = {
             "component": component,
             "workflow": self.workflow.name,
             "workflow_path": str(self.current_path) if self.current_path else "",
@@ -540,11 +543,11 @@ class AutoWorkAgent(tk.Tk):
         }
         if extra:
             context.update(extra)
-        report_path: Optional[Path] = None
+        report_path: Path | None = None
         capture_screen = bool(self.capture_on_error_enabled)
         try:
             report_path = write_error_report(context, exc, capture_screen=capture_screen, traceback_text=str(context.get("traceback", "")) or None)
-        except Exception as report_exc:
+        except Exception as report_exc:  # noqa: BLE001
             append_log(f"오류 보고서 작성 실패: {report_exc}", "ERROR")
         append_log(f"{component} 중지: {type(exc).__name__}: {str(exc)[:500]}", "ERROR")
         status = f"{component} 안전 중지"
@@ -554,7 +557,7 @@ class AutoWorkAgent(tk.Tk):
         self.after(0, self._refresh_log_view)
         return report_path
 
-    def _show_exception_dialog(self, component: str, exc: BaseException, report_path: Optional[Path]) -> None:
+    def _show_exception_dialog(self, component: str, exc: BaseException, report_path: Path | None) -> None:
         location = f"\n\n오류 보고서: {report_path}" if report_path else ""
         messagebox.showerror(f"{component} 안전 중지", f"{type(exc).__name__}: {str(exc)[:1200]}{location}\n\n진단·로그 탭에서 상세 기록을 확인하세요.")
 
@@ -576,7 +579,7 @@ class AutoWorkAgent(tk.Tk):
         self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
         self.after(0, lambda: self._offer_recovery_plan(failure_context))
 
-    def _offer_recovery_plan(self, failure_context: Dict[str, Any]) -> None:
+    def _offer_recovery_plan(self, failure_context: dict[str, Any]) -> None:
         if not messagebox.askyesno("AI 복구 분석", "실패한 화면을 다시 관찰해 복구 계획을 제안할까요?\n\n복구안은 자동 실행되지 않으며 사용자가 검토해야 합니다."):
             return
         if self.ai_running or not self._ai_job_lock.acquire(blocking=False):
@@ -594,7 +597,7 @@ class AutoWorkAgent(tk.Tk):
         self._set_status("실패 원인 분석 및 복구 계획 생성 중…")
         threading.Thread(target=self._recovery_worker, args=(failure_context, settings), daemon=True, name="recovery-planner").start()
 
-    def _recovery_worker(self, failure_context: Dict[str, Any], settings: Dict[str, Any]) -> None:
+    def _recovery_worker(self, failure_context: dict[str, Any], settings: dict[str, Any]) -> None:
         try:
             observation = capture_observation()
             observation["policy_profile"] = str(settings.get("policy_profile", DEFAULT_POLICY_PROFILE))
@@ -612,7 +615,7 @@ class AutoWorkAgent(tk.Tk):
             plan = client.make_recovery_plan(failure_context, observation)
             self.after(0, lambda: self._show_ai_result(observation, plan))
             self.after(0, lambda: self._set_status("복구 계획 생성 완료 · 검토 후 실행 가능"))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             report_path = self._handle_exception("복구 계획 생성", exc, {"failure": failure_context})
             self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("복구 계획 생성", error, path))
         finally:
@@ -631,7 +634,7 @@ class AutoWorkAgent(tk.Tk):
                 "<ctrl>+<alt>+<f12>": self._emergency_stop,
             })
             self.hotkey_listener.start()
-        except Exception:
+        except Exception:  # noqa: BLE001
             self.hotkey_listener = None
 
     def _emergency_stop(self) -> None:
@@ -693,7 +696,7 @@ class AutoWorkAgent(tk.Tk):
             detail = f"키 {step.event or ''}: {step.value or ''}"
         self.step_tree.insert("", "end", values=(index, step.type, f"{step.delay:.3f}", position, detail))
 
-    def _selected_step_index(self, show_message: bool = True) -> Optional[int]:
+    def _selected_step_index(self, show_message: bool = True) -> int | None:
         selection = self.step_tree.selection()
         if not selection:
             if show_message:
@@ -813,7 +816,7 @@ class AutoWorkAgent(tk.Tk):
         try:
             save_workflow(self.workflow, Path(path))
             self._set_status(f"템플릿 저장 완료 · {Path(path).name}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("템플릿 저장 실패", str(exc))
 
     def _load_template(self) -> None:
@@ -831,7 +834,7 @@ class AutoWorkAgent(tk.Tk):
             self.current_path = None
             self._refresh_steps()
             self._set_status(f"템플릿 불러오기 완료 · {Path(path).name}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("템플릿 불러오기 실패", str(exc))
 
     def _start_recording(self) -> None:
@@ -846,7 +849,7 @@ class AutoWorkAgent(tk.Tk):
             )
             self._refresh_steps()
             self.recorder.start(clear=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("기록 시작 실패", str(exc))
             return
         self.recording = True
@@ -929,7 +932,7 @@ class AutoWorkAgent(tk.Tk):
             self._refresh_steps()
             self.last_failed_step_index = start_index
             self._resume_failed_workflow()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             clear_execution_checkpoint()
             self._pending_checkpoint = None
             self.recover_checkpoint_button.configure(state="disabled")
@@ -985,18 +988,25 @@ class AutoWorkAgent(tk.Tk):
             return
         recorded_size = self.workflow.recorded_screen_size
         current_size = get_screen_size()
-        if recorded_size and current_size and tuple(recorded_size) != current_size:
-            if not messagebox.askyesno(
+        if (
+            recorded_size
+            and current_size
+            and tuple(recorded_size) != current_size
+            and not messagebox.askyesno(
                 "화면 크기 불일치",
                 f"기록 당시 화면: {recorded_size[0]}×{recorded_size[1]}\n"
                 f"현재 화면: {current_size[0]}×{current_size[1]}\n\n"
                 "좌표 기반 재생의 위치가 달라질 수 있습니다. 그래도 계속하시겠습니까?",
-            ):
-                self._playback_launch_lock.release()
-                return
+            )
+        ):
+            self._playback_launch_lock.release()
+            return
         ok = messagebox.askyesno(
             "재생 확인",
-            "저장된 모든 마우스·키보드 동작을 현재 화면에서 실행합니다.\n\n"            "민감한 정보 입력이나 문서 전송이 포함되어 있지 않은지 확인했습니까?",
+            (
+                "저장된 모든 마우스·키보드 동작을 현재 화면에서 실행합니다.\n\n"
+                "민감한 정보 입력이나 문서 전송이 포함되어 있지 않은지 확인했습니까?"
+            ),
         )
         if not ok:
             self._playback_launch_lock.release()
@@ -1043,7 +1053,7 @@ class AutoWorkAgent(tk.Tk):
                 self.last_failed_step_index = None
                 self.after(0, lambda: self.resume_play_button.configure(state="disabled"))
                 self.after(0, lambda: self.recover_checkpoint_button.configure(state="disabled"))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             duration = round(time.monotonic() - started_at, 3)
             report_path = write_execution_report(
                 run_id, "playback_failed", workflow, mode="playback", start_step=start_index + 1,
@@ -1080,7 +1090,7 @@ class AutoWorkAgent(tk.Tk):
             self.current_path = Path(path)
             backup_note = f" · 백업 {backup_path.name}" if backup_path else ""
             self._set_status(f"저장 완료 · {self.current_path.name}{backup_note}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("저장 실패", str(exc))
 
     def _restore_workflow_backup(self) -> None:
@@ -1113,7 +1123,7 @@ class AutoWorkAgent(tk.Tk):
             self._refresh_steps()
             self._set_status(f"백업 복원 완료 · {target.name}")
             append_execution_history("workflow_backup_restored", restored, source=Path(backup_path).name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("백업 복원 실패", str(exc))
 
     def _load_workflow(self) -> None:
@@ -1134,7 +1144,7 @@ class AutoWorkAgent(tk.Tk):
                 self._pending_checkpoint = None
                 self.recover_checkpoint_button.configure(state="disabled")
             self._set_status(f"불러오기 완료 · {self.current_path.name} · {signature_status}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("불러오기 실패", str(exc))
 
     def _save_prompt_template(self) -> None:
@@ -1154,7 +1164,7 @@ class AutoWorkAgent(tk.Tk):
         try:
             saved = save_prompt_template(Path(path), Path(path).stem, goal_template, self._current_policy_profile(), [str(item) for item in normalize_document_roots(self.document_roots_var.get())])
             self._set_status(f"자연어 템플릿 저장 완료 · {Path(path).name} · v{saved.get('revision', 1)}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("자연어 템플릿 저장 실패", str(exc))
 
     def _compare_prompt_templates(self) -> None:
@@ -1192,7 +1202,7 @@ class AutoWorkAgent(tk.Tk):
                 f"변경 필드: {changed_text}\n"
                 "템플릿 본문은 진단 이력에 기록하지 않습니다.",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("템플릿 버전·비교 실패", str(exc))
 
     def _load_prompt_template(self) -> None:
@@ -1205,7 +1215,7 @@ class AutoWorkAgent(tk.Tk):
             return
         try:
             data = load_prompt_template(Path(path))
-            values: Dict[str, Any] = {}
+            values: dict[str, Any] = {}
             for placeholder in data.get("placeholders", []):
                 value = simpledialog.askstring("템플릿 변수", f"{placeholder} 값을 입력하세요.", parent=self)
                 if value is None:
@@ -1221,7 +1231,7 @@ class AutoWorkAgent(tk.Tk):
             if isinstance(roots, list):
                 self.document_roots_var.set(";".join(str(item) for item in roots))
             self._set_status(f"자연어 템플릿 불러오기 완료 · {Path(path).name}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("자연어 템플릿 불러오기 실패", str(exc))
 
     def _make_ai_plan(self) -> None:
@@ -1260,7 +1270,7 @@ class AutoWorkAgent(tk.Tk):
         self._set_status("화면 관찰 및 로컬 AI 계획 생성 중…")
         threading.Thread(target=self._agent_worker, args=(goal, settings), daemon=True).start()
 
-    def _agent_worker(self, goal: str, settings: Dict[str, Any]) -> None:
+    def _agent_worker(self, goal: str, settings: dict[str, Any]) -> None:
         try:
             observation = capture_observation()
             observation["policy_profile"] = str(settings.get("policy_profile", DEFAULT_POLICY_PROFILE))
@@ -1273,14 +1283,14 @@ class AutoWorkAgent(tk.Tk):
             )
             plan = client.make_plan(goal, observation)
             self.after(0, lambda: self._show_ai_result(observation, plan))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal), "policy_profile": settings.get("policy_profile", DEFAULT_POLICY_PROFILE)})
             self.after(0, lambda error=exc, path=report_path: self._agent_failed(error, path))
         finally:
             self.ai_running = False
             self._ai_job_lock.release()
 
-    def _agent_failed(self, error: BaseException, report_path: Optional[Path]) -> None:
+    def _agent_failed(self, error: BaseException, report_path: Path | None) -> None:
         self._set_status("AI 계획 생성 실패")
         location = f"\n\n오류 보고서: {report_path}" if report_path else ""
         messagebox.showerror(
@@ -1298,7 +1308,7 @@ class AutoWorkAgent(tk.Tk):
         widget.insert("1.0", text)
         widget.configure(state="disabled")
 
-    def _show_ai_result(self, observation: Dict[str, Any], plan: Dict[str, Any]) -> None:
+    def _show_ai_result(self, observation: dict[str, Any], plan: dict[str, Any]) -> None:
         self.last_observation = observation
         self.last_plan = plan
         obs_display = {
@@ -1400,7 +1410,7 @@ class AutoWorkAgent(tk.Tk):
             pyautogui.write(text, interval=0.01)
 
     @staticmethod
-    def _element_center(element: Dict[str, Any]) -> tuple[int, int]:
+    def _element_center(element: dict[str, Any]) -> tuple[int, int]:
         bbox = element.get("bbox") or element.get("rectangle") or []
         if len(bbox) != 4:
             raise RetryableAutomationError("UI 요소 영역이 없습니다.")
@@ -1428,7 +1438,7 @@ class AutoWorkAgent(tk.Tk):
             time.sleep(0.4)
         raise RetryableAutomationError(f"실행 후 기대 문구를 확인하지 못했습니다: {expected_texts}")
 
-    def _execute_ai_step_once(self, step: Dict[str, Any], observation: Dict[str, Any]) -> None:
+    def _execute_ai_step_once(self, step: dict[str, Any], observation: dict[str, Any]) -> None:
         action = str(step.get("action", "none"))
         if action == "none":
             raise RetryableAutomationError("AI가 실행할 수 있는 동작을 결정하지 못했습니다.")
@@ -1467,7 +1477,7 @@ class AutoWorkAgent(tk.Tk):
     def _run_ai_steps(self, steps: list[dict[str, Any]]) -> None:
         started_at = time.monotonic()
         stopped = False
-        failed_step: Dict[str, Any] = {}
+        failed_step: dict[str, Any] = {}
         run_error_type = ""
         outcome = "ai_plan_failed"
         try:
@@ -1481,7 +1491,7 @@ class AutoWorkAgent(tk.Tk):
                     stopped = True
                     break
                 failed_step = step
-                last_error: Optional[BaseException] = None
+                last_error: BaseException | None = None
                 for attempt in range(1, 4):
                     if self.ai_stop_event.is_set():
                         stopped = True
@@ -1517,7 +1527,7 @@ class AutoWorkAgent(tk.Tk):
                 self._set_status(f"AI 계획 실행 중: {index}/{len(steps)}")
             outcome = "ai_plan_stopped" if stopped else ("ai_plan_dry_run_completed" if self.dry_run_enabled else "ai_plan_completed")
             self._set_status("AI 계획 사용자 중지" if stopped else ("AI 계획 검증 완료(dry-run)" if self.dry_run_enabled else "AI 계획 실행 완료"))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             run_error_type = type(exc).__name__
             report_path = self._handle_exception("AI 계획 실행", exc, {"failed_step": self.last_ai_index, "step": failed_step})
             self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("AI 계획 실행", error, path))
@@ -1570,7 +1580,7 @@ class AutoWorkAgent(tk.Tk):
             }
             atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
             self._set_status("로컬 AI 설정 저장 완료")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror("설정 저장 실패", str(exc))
 
     def _check_ai_connection(self) -> None:
@@ -1583,7 +1593,7 @@ class AutoWorkAgent(tk.Tk):
             )
             self.connection_status_var.set("연결 점검 중...")
             threading.Thread(target=self._check_ai_connection_worker, args=(client,), daemon=True, name="ai-health-check").start()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.connection_status_var.set("설정 오류")
             messagebox.showerror("연결 점검 실패", str(exc))
 
@@ -1591,10 +1601,10 @@ class AutoWorkAgent(tk.Tk):
         try:
             result = client.health_check()
             self.after(0, lambda: self._show_ai_connection_result(client.model, result))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.after(0, lambda error=exc: self._show_ai_connection_error(error))
 
-    def _show_ai_connection_result(self, model: str, result: Dict[str, Any]) -> None:
+    def _show_ai_connection_result(self, model: str, result: dict[str, Any]) -> None:
         models = result.get("models", [])
         self.connection_status_var.set(f"연결됨 · 모델 {len(models)}개")
         model_note = f"\n현재 모델 '{model}'이 목록에 없습니다." if models and model not in models else ""
@@ -1633,7 +1643,7 @@ class AutoWorkAgent(tk.Tk):
                 consecutive_failures=health["consecutive_failures"] if circuit_override else 0,
             )
             self._set_status(f"예약 실행 시작 · {interval}초 간격")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._scheduler_circuit_override = False
             messagebox.showerror("예약 실행 시작 실패", str(exc))
 
@@ -1700,12 +1710,12 @@ class AutoWorkAgent(tk.Tk):
         if self.hotkey_listener is not None:
             try:
                 self.hotkey_listener.stop()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                self.hotkey_listener = None
         try:
             self._refresh_monitor_view(status_override="closing")
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            self.monitor_status_var.set("운영 모니터를 종료 상태로 갱신하지 못했습니다.")
         self._save_config()
         self.destroy()
 

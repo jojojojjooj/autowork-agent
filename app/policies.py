@@ -6,7 +6,6 @@ import math
 from collections import Counter
 from typing import Any
 
-
 POLICY_PROFILES: dict[str, dict[str, Any]] = {
     "standard": {
         "label": "일반 업무",

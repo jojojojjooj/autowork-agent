@@ -6,60 +6,69 @@ from pathlib import Path
 import pytest
 
 from app import engine
-from app.adapters import build_adapter_context, build_document_context, build_read_only_adapter_validation, detect_application, normalize_document_roots, normalize_excel_cell_reference, search_approved_documents, validate_pdf_page_number
-from app.policies import review_plan, validate_plan_policy
-from app.release import validate_release_layout
+from app.adapters import (
+    build_adapter_context,
+    build_document_context,
+    build_read_only_adapter_validation,
+    detect_application,
+    normalize_document_roots,
+    normalize_excel_cell_reference,
+    search_approved_documents,
+    validate_pdf_page_number,
+)
 from app.engine import (
     LocalAIClient,
     LocalScheduler,
-    atomic_write_text,
     Step,
     Workflow,
     WorkflowPlayer,
     append_execution_history,
+    atomic_write_text,
     backup_workflow,
-    build_monitor_snapshot,
     build_execution_report_dashboard,
-    export_execution_report_summary,
+    build_monitor_snapshot,
     cleanup_workflow_backups,
+    clear_execution_checkpoint,
+    compare_prompt_template_versions,
+    compare_prompt_templates,
     evaluate_monitor_alerts,
     evaluate_scheduler_health,
+    export_execution_report_summary,
     export_support_bundle,
-    clear_execution_checkpoint,
-    load_execution_checkpoint,
-    save_execution_checkpoint,
+    inspect_workflow,
+    list_prompt_template_versions,
     list_workflow_backups,
-    read_monitor_snapshot,
-    read_execution_reports,
-    summarize_execution_reports,
-    write_monitor_snapshot,
+    load_execution_checkpoint,
+    load_prompt_template,
+    load_runtime_config,
+    load_workflow,
     mask_sensitive_text,
     read_execution_history,
+    read_execution_reports,
+    read_monitor_snapshot,
+    render_prompt_template,
+    resolve_observed_element,
+    save_execution_checkpoint,
+    save_prompt_template,
+    save_workflow,
     sign_workflow,
     summarize_execution_history,
+    summarize_execution_reports,
     trim_execution_history,
-    inspect_workflow,
-    load_workflow,
-    save_workflow,
     validate_ai_steps,
     validate_local_endpoint,
-    validate_timeout,
     validate_runtime_config,
-    load_runtime_config,
     validate_schedule_interval,
+    validate_timeout,
     validate_workflow,
-    resolve_observed_element,
-    verify_workflow_signature,
     verify_execution_history,
-    save_prompt_template,
-    load_prompt_template,
-    render_prompt_template,
-    list_prompt_template_versions,
-    compare_prompt_templates,
-    compare_prompt_template_versions,
+    verify_workflow_signature,
     write_error_report,
     write_execution_report,
+    write_monitor_snapshot,
 )
+from app.policies import review_plan, validate_plan_policy
+from app.release import validate_release_layout
 
 
 def test_workflow_roundtrip(tmp_path: Path):
@@ -834,3 +843,36 @@ def test_windows_release_layout_rejects_missing_files(tmp_path: Path):
     assert result["valid"] is False
     assert "file:README.md" in result["failed_checks"]
     assert "requirements:fully_pinned" in result["failed_checks"]
+
+
+def test_atomic_write_text_concurrent_writers_leave_one_complete_payload(tmp_path: Path):
+    target = tmp_path / "concurrent-state.json"
+    payloads = [f"writer-{index}-" + ("가" * 4096) for index in range(8)]
+    barrier = threading.Barrier(len(payloads))
+    failures: list[Exception] = []
+
+    def write_payload(payload: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            atomic_write_text(target, payload)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    threads = [threading.Thread(target=write_payload, args=(payload,)) for payload in payloads]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert failures == []
+    assert target.read_text(encoding="utf-8") in payloads
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_workflow_from_dict_reports_type_errors_for_wrong_container_types():
+    with pytest.raises(TypeError, match="최상위"):
+        Workflow.from_dict([])
+    with pytest.raises(TypeError, match="단계"):
+        Workflow.from_dict({"version": 2, "steps": {}})
+    with pytest.raises(TypeError, match="이름"):
+        Workflow.from_dict({"version": 2, "name": 123, "steps": []})

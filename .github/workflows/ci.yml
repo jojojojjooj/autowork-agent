@@ -34,6 +34,12 @@ jobs:
         env:
           PYTHONPATH: .
         run: pytest -q
+      - name: Run Linux GUI smoke
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-tk xvfb
+          xvfb-run -a python tests/gui_smoke.py
       - name: Compile Python sources
         run: python -m py_compile app/engine.py app/main.py app/adapters.py app/policies.py app/release.py
       - name: Validate Windows release layout

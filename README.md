@@ -28,6 +28,7 @@
 | 읽기 전용 전용 어댑터 | Excel 셀·범위와 PDF 페이지 단서를 정규화하고 HWP·브라우저 맥락을 보수적으로 안내 | 파일 수정·제출 없음 |
 | Windows 배포 검증 | 고정 의존성·필수 파일·설치/실행/빌드 스크립트의 오프라인 안전 표식을 정적으로 검사 | `python -m app.release .` |
 | Windows Smoke CI | GitHub Windows runner에서 런타임 import·회귀 테스트·PyInstaller 산출물 확인 | `.github/workflows/windows-smoke.yml` |
+| Linux GUI Smoke | Xvfb에서 실제 Tkinter 창의 초기화·콜백·종료 수명주기 확인 | `tests/gui_smoke.py` |
 | 사용자 흐름 시나리오 | 저장·서명·재로드·재생·복구·AI 사전검토를 실제 순서로 검증 | `tests/test_scenarios.py` |
 | 문서 변경 시나리오 | 임시 승인 루트의 텍스트 문서를 명시적 확인·백업·원자 저장 후 변경하고 결과 검증 | `tests/test_scenarios.py -k document_change` |
 | 문서 경계조건 회귀 | 잘못된 문서·백업 SHA, 미승인 복구, 크기 초과, 깨진 OOXML을 격리 fixture로 거부하는지 확인 | `tests/test_scenarios.py` |
@@ -111,7 +112,7 @@ Ollama나 LM Studio를 로컬에서 실행한 뒤 **설정** 탭에서 주소와
 
 ## 테스트 및 빌드
 
-개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 64개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다. 문서 경계조건까지 포함한 모든 문서 시나리오는 `python -m pytest -q tests/test_scenarios.py -k 'document or real_docx or real_xlsx'`로 실행하고, 실제 DOCX·XLSX 변경만 확인하려면 `python -m pytest -q tests/test_scenarios.py -k 'real_docx or real_xlsx'`를 사용합니다. 로컬 문서 검색은 임시 승인 디렉터리만 대상으로 합니다.
+개발 테스트는 다음과 같이 실행합니다. 현재 전체 테스트는 68개이며, 사용자 흐름 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py`를 사용하고 문서 변경 시나리오만 실행하려면 `python -m pytest -q tests/test_scenarios.py -k document_change`를 사용합니다. 문서 경계조건까지 포함한 모든 문서 시나리오는 `python -m pytest -q tests/test_scenarios.py -k 'document or real_docx or real_xlsx'`로 실행하고, 실제 DOCX·XLSX 변경만 확인하려면 `python -m pytest -q tests/test_scenarios.py -k 'real_docx or real_xlsx'`를 사용합니다. Linux에서 실제 Tkinter 창의 시작·종료를 확인하려면 `xvfb-run -a python tests/gui_smoke.py`를 사용합니다. 로컬 문서 검색은 임시 승인 디렉터리만 대상으로 합니다.
  GitHub Actions는 Ubuntu와 Windows runner에서 Python 3.11·3.12 조합을 검증하고, Windows 배포 레이아웃 정적 검사도 수행합니다. 별도 Dependency audit job은 `requirements.lock.txt`의 고정 의존성을 `pip-audit`으로 검사해 알려진 취약 버전의 병합을 차단합니다.
 
 ```powershell
@@ -145,7 +146,8 @@ auto_work_agent/
 │  └─ __init__.py
 ├─ tests/
 │  ├─ test_engine.py
-│  └─ test_scenarios.py
+│  ├─ test_scenarios.py
+│  └─ gui_smoke.py
 ├─ requirements.txt
 ├─ requirements.lock.txt
 ├─ requirements-dev.txt

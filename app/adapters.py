@@ -10,10 +10,12 @@ import hashlib
 import io
 import re
 import zipfile
-from defusedxml import ElementTree as SafeElementTree
+from collections.abc import Iterable
 from html import escape as xml_escape
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from defusedxml import ElementTree as SafeElementTree
 
 try:
     from engine import atomic_write_bytes, atomic_write_text
@@ -24,9 +26,9 @@ except ImportError:  # pragma: no cover - package import path
 EXCEL_CELL_RE = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})(?![A-Za-z0-9_])")
 EXCEL_RANGE_RE = re.compile(
     r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})\s*:\s*\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})(?![A-Za-z0-9_])",
-    re.I,
+    re.IGNORECASE,
 )
-PAGE_RE = re.compile(r"(?:page|페이지|쪽)\s*[:#]?\s*([1-9][0-9]{0,5})", re.I)
+PAGE_RE = re.compile(r"(?:page|페이지|쪽)\s*[:#]?\s*([1-9][0-9]{0,5})", re.IGNORECASE)
 TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json", ".log", ".xml", ".yaml", ".yml"}
 DOCUMENT_SUFFIXES = TEXT_SUFFIXES | {".pdf", ".xlsx", ".xlsm", ".hwp", ".hwpx"}
 MAX_DOCUMENT_ROOTS = 5

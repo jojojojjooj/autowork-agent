@@ -10,10 +10,10 @@ import io
 import json
 import zipfile
 from html import escape as xml_escape
-from defusedxml import ElementTree as SafeElementTree
 from pathlib import Path
 
 import pytest
+from defusedxml import ElementTree as SafeElementTree
 
 from app import adapters, engine
 from app.adapters import (
@@ -341,3 +341,66 @@ def test_scenario_office_mutation_rejects_malformed_changed_xml(tmp_path: Path):
         )
     assert document.read_bytes() == original
     assert not list(approved.glob("*.bak"))
+
+
+def test_scenario_document_path_and_backup_edge_cases(tmp_path: Path):
+    approved = tmp_path / "approved"
+    outside = tmp_path / "outside"
+    approved.mkdir()
+    outside.mkdir()
+    outside_document = outside / "outside.md"
+    outside_document.write_text("상태: 외부", encoding="utf-8")
+    linked_document = approved / "linked.md"
+    linked_document.symlink_to(outside_document)
+
+    with pytest.raises(ValueError, match="루트 밖에|symlink"):
+        update_approved_text_document(
+            [str(approved)], "linked.md", "상태: 외부", "상태: 차단", confirmed=True
+        )
+
+    document = approved / "report[1].md"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+    result = update_approved_text_document(
+        [str(approved)], "report[1].md", "상태: 초안", "상태: 완료", confirmed=True
+    )
+    verified = verify_document_change(
+        (str(approved) for _ in range(1)),
+        "report[1].md",
+        result["after_sha256"],
+        expected_backup_sha256=result["before_sha256"],
+    )
+    assert verified["backup_relative_path"] == result["backup_relative_path"]
+    restored = restore_document_backup(
+        (str(approved) for _ in range(1)),
+        "report[1].md",
+        result["after_sha256"],
+        result["before_sha256"],
+        confirmed=True,
+    )
+    assert restored["restored_sha256"] == result["before_sha256"]
+    assert document.read_text(encoding="utf-8") == "상태: 초안\n"
+
+
+def test_scenario_office_size_guard_and_zip_traversal_are_rejected(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    oversized = approved / "oversized.docx"
+    _write_office_fixture(oversized, ".docx", "상태: 초안")
+    monkeypatch.setattr(adapters, "MAX_OFFICE_PACKAGE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="허용 크기"):
+        update_approved_office_document(
+            [str(approved)], "oversized.docx", "상태: 초안", "상태: 완료", confirmed=True
+        )
+
+    monkeypatch.setattr(adapters, "MAX_OFFICE_PACKAGE_BYTES", 20 * 1024 * 1024)
+    unsafe = approved / "unsafe.docx"
+    with zipfile.ZipFile(unsafe, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("../outside.xml", "<outside/>")
+        archive.writestr("word/document.xml", "<document>상태: 초안</document>")
+    original = unsafe.read_bytes()
+    with pytest.raises(ValueError, match="내부 경로"):
+        update_approved_office_document(
+            [str(approved)], "unsafe.docx", "상태: 초안", "상태: 완료", confirmed=True
+        )
+    assert unsafe.read_bytes() == original
