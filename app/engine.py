@@ -2131,7 +2131,6 @@ def validate_ai_steps(
     if width <= 0 or height <= 0:
         return False, "화면 크기가 올바르지 않습니다. 화면을 다시 관찰하세요."
     safe_hotkeys = {"ctrl", "shift", "alt", "win", "enter", "esc", "tab", "space", "backspace", "delete", "home", "end", "left", "right", "up", "down"}
-    dangerous = {("alt", "f4"), ("ctrl", "shift", "delete")}
     for index, action in enumerate(parsed.steps, start=1):
         if action.action == "none":
             return False, f"{index}번째 단계: AI가 확신하지 못해 실행하지 않습니다."

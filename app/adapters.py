@@ -11,6 +11,7 @@ import io
 import os
 import re
 import zipfile
+from defusedxml import ElementTree as SafeElementTree
 from html import escape as xml_escape
 from pathlib import Path
 from typing import Any, Iterable
@@ -216,6 +217,8 @@ def update_approved_text_document(
     if resolved.suffix.casefold() not in TEXT_MUTATION_SUFFIXES:
         raise ValueError("변경은 승인된 텍스트 문서 확장자만 지원합니다.")
     try:
+        if resolved.stat().st_size > MAX_DOCUMENT_BYTES:
+            raise ValueError("변경 대상 문서가 허용 크기를 초과합니다.")
         current = resolved.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ValueError("문서를 UTF-8 텍스트로 읽을 수 없습니다.") from exc
@@ -334,9 +337,11 @@ def update_approved_office_document(
         with zipfile.ZipFile(io.BytesIO(updated), "r") as archive:
             if archive.testzip() is not None:
                 raise ValueError("변경 후 Office 문서의 압축 무결성 검증에 실패했습니다.")
-            archive.read(changed_part)
-    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+            SafeElementTree.fromstring(archive.read(changed_part))
+    except (OSError, zipfile.BadZipFile, KeyError, SafeElementTree.ParseError) as exc:
         raise ValueError("변경 후 Office 문서를 다시 열 수 없습니다.") from exc
+    if len(updated) > MAX_OFFICE_PACKAGE_BYTES:
+        raise ValueError("변경 후 Office 문서가 허용 크기를 초과합니다.")
     after_hash = hashlib.sha256(updated).hexdigest()
     backup = resolved.with_name(f".{resolved.name}.autowork-{before_hash[:12]}.bak")
     temporary_backup = backup.with_name(f".{backup.name}.tmp")
@@ -388,6 +393,12 @@ def verify_document_change(
         raise ValueError("문서 경로가 승인된 루트 밖에 있습니다.") from exc
     if resolved.is_symlink() or not resolved.is_file():
         raise ValueError("검증 대상 문서가 없거나 symlink입니다.")
+    try:
+        size_limit = MAX_OFFICE_PACKAGE_BYTES if resolved.suffix.casefold() in OFFICE_MUTATION_SUFFIXES else MAX_DOCUMENT_BYTES
+        if resolved.stat().st_size > size_limit:
+            raise ValueError("검증 대상 문서가 허용 크기를 초과합니다.")
+    except OSError as exc:
+        raise ValueError("검증 대상 문서의 크기를 확인할 수 없습니다.") from exc
     expected = str(expected_sha256 or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise ValueError("예상 SHA-256 값이 올바르지 않습니다.")
@@ -403,7 +414,15 @@ def verify_document_change(
         backup_expected = str(expected_backup_sha256).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", backup_expected):
             raise ValueError("예상 백업 SHA-256 값이 올바르지 않습니다.")
-        candidates = sorted(resolved.parent.glob(f".{resolved.name}.autowork-*.bak"), key=lambda item: item.stat().st_mtime, reverse=True)
+        candidates = sorted(
+            (
+                item
+                for item in resolved.parent.iterdir()
+                if item.name.startswith(f".{resolved.name}.autowork-") and item.name.endswith(".bak")
+            ),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
         backup = None
         backup_actual = ""
         for candidate in candidates:
@@ -432,8 +451,11 @@ def restore_document_backup(
     """Restore the verified backup over a document after explicit confirmation."""
     if confirmed is not True:
         raise PermissionError("문서 복구는 명시적인 사용자 확인이 필요합니다.")
-    verification = verify_document_change(roots, relative_path, expected_current_sha256, expected_backup_sha256=expected_backup_sha256)
+    backup_expected = str(expected_backup_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", backup_expected):
+        raise ValueError("예상 백업 SHA-256 값이 올바르지 않습니다.")
     approved = normalize_document_roots(roots)
+    verification = verify_document_change(approved, relative_path, expected_current_sha256, expected_backup_sha256=backup_expected)
     root = approved[0]
     resolved = (root / Path(relative_path)).resolve()
     backup = root / Path(verification["backup_relative_path"])
@@ -449,7 +471,7 @@ def restore_document_backup(
             pass
         raise OSError(f"문서 백업을 원자적으로 복구하지 못했습니다: {exc}") from exc
     restored_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
-    if restored_sha != expected_backup_sha256.lower():
+    if restored_sha != backup_expected:
         raise ValueError("복구 후 문서 SHA-256이 백업값과 일치하지 않습니다.")
     return {
         "relative_path": str(resolved.relative_to(root)),

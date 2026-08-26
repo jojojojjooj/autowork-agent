@@ -14,10 +14,7 @@ from typing import Any, Dict, Optional
 from engine import (
     APP_DIR,
     BACKUP_DIR,
-    CHECKPOINT_PATH,
     CONFIG_PATH,
-    HISTORY_PATH,
-    DEBUG_DIR,
     ERROR_DIR,
     TEMPLATE_DIR,
     LOG_PATH,
@@ -42,7 +39,6 @@ from engine import (
     summarize_execution_history,
     build_monitor_snapshot,
     write_monitor_snapshot,
-    read_monitor_snapshot,
     export_support_bundle,
     capture_observation,
     cleanup_expired_artifacts,
@@ -62,7 +58,6 @@ from engine import (
     validate_ai_steps,
     validate_local_endpoint,
     validate_timeout,
-    validate_runtime_config,
     load_runtime_config,
     validate_schedule_interval,
     save_prompt_template,
@@ -74,9 +69,9 @@ try:
 except ImportError:
     from app.adapters import build_document_context, normalize_document_roots
 try:
-    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile, review_plan
+    from policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, review_plan
 except ImportError:
-    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, get_policy_profile, review_plan
+    from app.policies import POLICY_PROFILES, DEFAULT_POLICY_PROFILE, review_plan
 
 try:
     import pyautogui
@@ -618,7 +613,7 @@ class AutoWorkAgent(tk.Tk):
             self.after(0, lambda: self._set_status("복구 계획 생성 완료 · 검토 후 실행 가능"))
         except Exception as exc:
             report_path = self._handle_exception("복구 계획 생성", exc, {"failure": failure_context})
-            self.after(0, lambda: self._show_exception_dialog("복구 계획 생성", exc, report_path))
+            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("복구 계획 생성", error, path))
         finally:
             self.ai_running = False
             self._ai_job_lock.release()
@@ -1060,7 +1055,7 @@ class AutoWorkAgent(tk.Tk):
             save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
             self._pending_checkpoint = load_execution_checkpoint()
             report_path = self._handle_exception("작업 재생", exc)
-            self.after(0, lambda: self._show_exception_dialog("작업 재생", exc, report_path))
+            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("작업 재생", error, path))
         finally:
             self._step_gate.set()
             self.step_mode_enabled = False
@@ -1279,7 +1274,7 @@ class AutoWorkAgent(tk.Tk):
             self.after(0, lambda: self._show_ai_result(observation, plan))
         except Exception as exc:
             report_path = self._handle_exception("AI 계획 생성", exc, {"goal_length": len(goal), "policy_profile": settings.get("policy_profile", DEFAULT_POLICY_PROFILE)})
-            self.after(0, lambda: self._agent_failed(exc, report_path))
+            self.after(0, lambda error=exc, path=report_path: self._agent_failed(error, path))
         finally:
             self.ai_running = False
             self._ai_job_lock.release()
@@ -1524,7 +1519,7 @@ class AutoWorkAgent(tk.Tk):
         except Exception as exc:
             run_error_type = type(exc).__name__
             report_path = self._handle_exception("AI 계획 실행", exc, {"failed_step": self.last_ai_index, "step": failed_step})
-            self.after(0, lambda: self._show_exception_dialog("AI 계획 실행", exc, report_path))
+            self.after(0, lambda error=exc, path=report_path: self._show_exception_dialog("AI 계획 실행", error, path))
         finally:
             duration = round(time.monotonic() - started_at, 3)
             run_id = self.last_ai_run_id or secrets.token_hex(8)
@@ -1598,7 +1593,7 @@ class AutoWorkAgent(tk.Tk):
             result = client.health_check()
             self.after(0, lambda: self._show_ai_connection_result(client.model, result))
         except Exception as exc:
-            self.after(0, lambda: self._show_ai_connection_error(exc))
+            self.after(0, lambda error=exc: self._show_ai_connection_error(error))
 
     def _show_ai_connection_result(self, model: str, result: Dict[str, Any]) -> None:
         models = result.get("models", [])

@@ -10,12 +10,18 @@ import io
 import json
 import zipfile
 from html import escape as xml_escape
-from xml.etree import ElementTree
+from defusedxml import ElementTree as SafeElementTree
 from pathlib import Path
 
 import pytest
 
-from app import engine
+from app import adapters, engine
+from app.adapters import (
+    restore_document_backup,
+    update_approved_office_document,
+    update_approved_text_document,
+    verify_document_change,
+)
 from app.engine import (
     Step,
     Workflow,
@@ -30,7 +36,6 @@ from app.engine import (
     verify_workflow_signature,
     write_execution_report,
 )
-from app.adapters import restore_document_backup, update_approved_office_document, update_approved_text_document, verify_document_change
 from app.policies import review_plan
 
 
@@ -241,7 +246,7 @@ def test_scenario_real_docx_mutation_reopens_and_preserves_backup(tmp_path: Path
     with zipfile.ZipFile(io.BytesIO(changed), "r") as archive:
         assert archive.testzip() is None
         xml = archive.read("word/document.xml")
-        ElementTree.fromstring(xml)
+        SafeElementTree.fromstring(xml)
         assert "상태: 초안" not in xml.decode("utf-8")
         assert "상태: 승인 대기" in xml.decode("utf-8")
     verified = verify_document_change([str(approved)], "report.docx", result["after_sha256"], expected_backup_sha256=result["before_sha256"])
@@ -267,5 +272,72 @@ def test_scenario_real_xlsx_mutation_reopens_and_preserves_backup(tmp_path: Path
     with zipfile.ZipFile(io.BytesIO(changed), "r") as archive:
         assert archive.testzip() is None
         xml = archive.read("xl/worksheets/sheet1.xml")
-        ElementTree.fromstring(xml)
+        SafeElementTree.fromstring(xml)
         assert "합계: 120" in xml.decode("utf-8")
+
+
+def test_scenario_document_audit_rejects_wrong_hash_and_requires_confirmed_restore(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "audit.md"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+
+    result = update_approved_text_document(
+        [str(approved)], "audit.md", "상태: 초안", "상태: 완료", confirmed=True
+    )
+    with pytest.raises(ValueError, match="SHA-256"):
+        verify_document_change([str(approved)], "audit.md", "0" * 64)
+    with pytest.raises(ValueError, match="백업"):
+        verify_document_change(
+            [str(approved)],
+            "audit.md",
+            result["after_sha256"],
+            expected_backup_sha256="1" * 64,
+        )
+    with pytest.raises(PermissionError, match="명시적인 사용자 확인"):
+        restore_document_backup(
+            [str(approved)],
+            "audit.md",
+            result["after_sha256"],
+            result["before_sha256"],
+            confirmed=False,
+        )
+    with pytest.raises(ValueError, match="백업 SHA-256"):
+        restore_document_backup(
+            [str(approved)],
+            "audit.md",
+            result["after_sha256"],
+            "invalid",
+            confirmed=True,
+        )
+
+
+def test_scenario_document_size_guard_runs_before_text_read(tmp_path: Path, monkeypatch):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "large.md"
+    document.write_text("상태: 초안\n", encoding="utf-8")
+    monkeypatch.setattr(adapters, "MAX_DOCUMENT_BYTES", 1)
+
+    with pytest.raises(ValueError, match="허용 크기"):
+        update_approved_text_document(
+            [str(approved)], "large.md", "상태: 초안", "상태: 완료", confirmed=True
+        )
+    assert not list(approved.glob("*.bak"))
+
+
+def test_scenario_office_mutation_rejects_malformed_changed_xml(tmp_path: Path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    document = approved / "broken.docx"
+    with zipfile.ZipFile(document, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/document.xml", "<w:document>상태: 초안")
+    original = document.read_bytes()
+
+    with pytest.raises(ValueError, match="다시 열 수"):
+        update_approved_office_document(
+            [str(approved)], "broken.docx", "상태: 초안", "상태: 완료", confirmed=True
+        )
+    assert document.read_bytes() == original
+    assert not list(approved.glob("*.bak"))
