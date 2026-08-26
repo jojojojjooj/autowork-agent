@@ -80,31 +80,33 @@ PII_PATTERNS = (
 _LOG_LOCK = threading.Lock()
 _HISTORY_LOCK = threading.Lock()
 _MONITOR_LOCK = threading.Lock()
+_ATOMIC_WRITE_LOCK = threading.Lock()
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     """Write bytes through a private same-directory temporary file and replace atomically."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    except Exception:
+    with _ATOMIC_WRITE_LOCK:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
+        temporary = Path(temporary_name)
         try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def atomic_write_text(path: Path, content: str) -> None:
