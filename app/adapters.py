@@ -366,6 +366,99 @@ def update_approved_office_document(
     }
 
 
+def verify_document_change(
+    roots: Iterable[str] | str | None,
+    relative_path: str,
+    expected_sha256: str,
+    *,
+    expected_backup_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Verify a changed local document and its optional backup by SHA-256."""
+    approved = normalize_document_roots(roots)
+    if len(approved) != 1:
+        raise ValueError("문서 검증에는 승인된 로컬 루트 하나가 필요합니다.")
+    root = approved[0]
+    raw_relative = str(relative_path or "").strip()
+    if not raw_relative or Path(raw_relative).is_absolute():
+        raise ValueError("문서 경로는 승인된 루트 기준 상대 경로여야 합니다.")
+    try:
+        resolved = (root / Path(raw_relative)).resolve()
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("문서 경로가 승인된 루트 밖에 있습니다.") from exc
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError("검증 대상 문서가 없거나 symlink입니다.")
+    expected = str(expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("예상 SHA-256 값이 올바르지 않습니다.")
+    actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    if actual != expected:
+        raise ValueError("문서 SHA-256이 예상값과 일치하지 않습니다.")
+    result: dict[str, Any] = {
+        "relative_path": str(resolved.relative_to(root)),
+        "sha256": actual,
+        "verified": True,
+    }
+    if expected_backup_sha256 is not None:
+        backup_expected = str(expected_backup_sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", backup_expected):
+            raise ValueError("예상 백업 SHA-256 값이 올바르지 않습니다.")
+        candidates = sorted(resolved.parent.glob(f".{resolved.name}.autowork-*.bak"), key=lambda item: item.stat().st_mtime, reverse=True)
+        backup = None
+        backup_actual = ""
+        for candidate in candidates:
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            if candidate_hash == backup_expected:
+                backup = candidate
+                backup_actual = candidate_hash
+                break
+        if backup is None:
+            raise ValueError("문서 변경 백업을 찾을 수 없거나 SHA-256이 일치하지 않습니다.")
+        result["backup_relative_path"] = str(backup.relative_to(root))
+        result["backup_sha256"] = backup_actual
+    return result
+
+
+def restore_document_backup(
+    roots: Iterable[str] | str | None,
+    relative_path: str,
+    expected_current_sha256: str,
+    expected_backup_sha256: str,
+    *,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Restore the verified backup over a document after explicit confirmation."""
+    if confirmed is not True:
+        raise PermissionError("문서 복구는 명시적인 사용자 확인이 필요합니다.")
+    verification = verify_document_change(roots, relative_path, expected_current_sha256, expected_backup_sha256=expected_backup_sha256)
+    approved = normalize_document_roots(roots)
+    root = approved[0]
+    resolved = (root / Path(relative_path)).resolve()
+    backup = root / Path(verification["backup_relative_path"])
+    temporary = resolved.with_name(f".{resolved.name}.restore.tmp")
+    try:
+        temporary.write_bytes(backup.read_bytes())
+        os.replace(temporary, resolved)
+    except OSError as exc:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+        raise OSError(f"문서 백업을 원자적으로 복구하지 못했습니다: {exc}") from exc
+    restored_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    if restored_sha != expected_backup_sha256.lower():
+        raise ValueError("복구 후 문서 SHA-256이 백업값과 일치하지 않습니다.")
+    return {
+        "relative_path": str(resolved.relative_to(root)),
+        "restored_sha256": restored_sha,
+        "backup_relative_path": str(backup.relative_to(root)),
+        "confirmed": True,
+    }
+
+
 def _query_tokens(query: str) -> list[str]:
     cleaned = (query or "")[:MAX_QUERY_CHARS].casefold()
     return list(dict.fromkeys(token for token in re.findall(r"[\w가-힣]{2,}", cleaned) if token not in {"해줘", "해주세요", "현재", "문서"}))[:20]

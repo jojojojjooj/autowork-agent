@@ -30,7 +30,7 @@ from app.engine import (
     verify_workflow_signature,
     write_execution_report,
 )
-from app.adapters import update_approved_office_document, update_approved_text_document
+from app.adapters import restore_document_backup, update_approved_office_document, update_approved_text_document, verify_document_change
 from app.policies import review_plan
 
 
@@ -242,8 +242,13 @@ def test_scenario_real_docx_mutation_reopens_and_preserves_backup(tmp_path: Path
         assert archive.testzip() is None
         xml = archive.read("word/document.xml")
         ElementTree.fromstring(xml)
-        assert b"%EC%83%81%ED%83%9C" not in xml
+        assert "상태: 초안" not in xml.decode("utf-8")
         assert "상태: 승인 대기" in xml.decode("utf-8")
+    verified = verify_document_change([str(approved)], "report.docx", result["after_sha256"], expected_backup_sha256=result["before_sha256"])
+    assert verified["verified"] is True
+    restored = restore_document_backup([str(approved)], "report.docx", result["after_sha256"], result["before_sha256"], confirmed=True)
+    assert restored["restored_sha256"] == result["before_sha256"]
+    assert document.read_bytes() == original
 
 
 def test_scenario_real_xlsx_mutation_reopens_and_preserves_backup(tmp_path: Path):
