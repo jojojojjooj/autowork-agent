@@ -52,6 +52,7 @@ from engine import (
     validate_workflow,
     verify_workflow_signature,
     verify_execution_history,
+    evaluate_scheduler_health,
     write_error_report,
     load_workflow,
     save_workflow,
@@ -1008,12 +1009,12 @@ class AutoWorkAgent(tk.Tk):
         self.pause_play_button.configure(state="normal", text="재생 일시정지")
         threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True).start()
 
-    def _play_workflow_worker(self, workflow: Workflow, start_index: int = 0) -> None:
+    def _play_workflow_worker(self, workflow: Workflow, start_index: int = 0, scheduled: bool = False) -> None:
         run_id = secrets.token_hex(8)
         started_at = time.monotonic()
         recorded_size = workflow.recorded_screen_size
         size_text = f"{recorded_size[0]}x{recorded_size[1]}" if recorded_size else ""
-        append_execution_history("playback_started", workflow, screen_size=size_text, start_step=start_index + 1, run_id=run_id)
+        append_execution_history("playback_started", workflow, screen_size=size_text, start_step=start_index + 1, run_id=run_id, scheduled=bool(scheduled))
         try:
             self.player.play(workflow, start_index=start_index)
             failure = self.player.failed or self.player.last_error
@@ -1026,7 +1027,7 @@ class AutoWorkAgent(tk.Tk):
                 )
                 append_execution_history(
                     "playback_failed", workflow, last_step=last_step, error=type(failure).__name__,
-                    run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "",
+                    run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "", scheduled=bool(scheduled),
                 )
             else:
                 event = "playback_stopped" if self.player.stop_event.is_set() else "playback_completed"
@@ -1036,7 +1037,7 @@ class AutoWorkAgent(tk.Tk):
                 )
                 append_execution_history(
                     event, workflow, last_step=self.player.current_index, run_id=run_id,
-                    duration_seconds=duration, report_path=str(report_path) if report_path else "",
+                    duration_seconds=duration, report_path=str(report_path) if report_path else "", scheduled=bool(scheduled),
                 )
                 clear_execution_checkpoint()
                 self._pending_checkpoint = None
@@ -1051,7 +1052,7 @@ class AutoWorkAgent(tk.Tk):
             )
             append_execution_history(
                 "playback_failed", workflow, last_step=self.player.current_index, error=type(exc).__name__,
-                run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "",
+                run_id=run_id, duration_seconds=duration, report_path=str(report_path) if report_path else "", scheduled=bool(scheduled),
             )
             save_execution_checkpoint(self.current_path, max(0, self.player.current_index - 1), workflow.signature or "", error_type=type(exc).__name__)
             self._pending_checkpoint = load_execution_checkpoint()
@@ -1643,6 +1644,13 @@ class AutoWorkAgent(tk.Tk):
             append_execution_history("scheduled_run_skipped", self.workflow, reason="audit_integrity_failure")
             self._set_status("예약 실행 중지 · 감사 이력 무결성 오류")
             return
+        scheduler_health = evaluate_scheduler_health()
+        if scheduler_health["circuit_open"]:
+            append_execution_history("scheduler_circuit_open", self.workflow, consecutive_failures=scheduler_health["consecutive_failures"])
+            self.scheduler.stop()
+            self.schedule_status_var.set("예약 실행 자동 중지 · 반복 실패")
+            self._set_status("예약 실행 자동 중지 · 반복 실패")
+            return
         valid, reason = validate_workflow(self.workflow, get_screen_size())
         if not valid:
             append_execution_history("scheduled_run_skipped", self.workflow, reason="invalid_workflow")
@@ -1655,7 +1663,7 @@ class AutoWorkAgent(tk.Tk):
         self._step_gate.clear()
         self.pause_play_button.configure(state="normal", text="재생 일시정지")
         append_execution_history("scheduled_run_approved", self.workflow)
-        threading.Thread(target=self._play_workflow_worker, args=(self.workflow,), daemon=True, name="scheduled-playback").start()
+        threading.Thread(target=self._play_workflow_worker, args=(self.workflow, 0, True), daemon=True, name="scheduled-playback").start()
 
     def _on_close(self) -> None:
         self.scheduler.stop()

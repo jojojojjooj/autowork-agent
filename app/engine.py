@@ -353,6 +353,30 @@ def evaluate_monitor_alerts(summary: Dict[str, Any], min_runs: int = 3, failure_
     return alerts
 
 
+def evaluate_scheduler_health(records: Optional[List[Dict[str, Any]]] = None, window: int = 5, failure_threshold: int = 3) -> Dict[str, Any]:
+    """Return a deterministic circuit-breaker state for scheduled playback."""
+    items = records if records is not None else read_execution_history(2_000)
+    scheduled = [
+        item for item in items
+        if bool(item.get("scheduled")) and str(item.get("event", "")) in {
+            "playback_completed", "playback_failed", "playback_stopped"
+        }
+    ][-max(1, int(window)):]
+    consecutive_failures = 0
+    for item in reversed(scheduled):
+        if item.get("event") != "playback_failed":
+            break
+        consecutive_failures += 1
+    threshold = max(1, int(failure_threshold))
+    return {
+        "window": len(scheduled),
+        "failures": sum(item.get("event") == "playback_failed" for item in scheduled),
+        "consecutive_failures": consecutive_failures,
+        "circuit_open": consecutive_failures >= threshold,
+        "failure_threshold": threshold,
+    }
+
+
 def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] = None, scheduler_running: bool = False, current_step: Optional[int] = None) -> Dict[str, Any]:
     """Build a privacy-conscious operational snapshot without steps or input values."""
     records = read_execution_history(2_000)
@@ -362,6 +386,9 @@ def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] 
     if not audit_integrity["valid"]:
         alerts.insert(0, {"severity": "critical", "code": "audit_integrity_failure", "message": "실행 감사 이력의 무결성 검증에 실패했습니다."})
     checkpoint = load_execution_checkpoint()
+    scheduler_health = evaluate_scheduler_health(records)
+    if scheduler_health["circuit_open"]:
+        alerts.insert(0, {"severity": "critical", "code": "scheduler_circuit_open", "message": "예약 실행이 반복 실패로 자동 중지 대기 상태입니다."})
     return redact_sensitive({
         "schema_version": MONITOR_SCHEMA_VERSION,
         "heartbeat_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -370,6 +397,7 @@ def build_monitor_snapshot(status: str = "idle", workflow: Optional["Workflow"] 
         "workflow_step_count": len(workflow.steps) if workflow else 0,
         "workflow_signed": bool(workflow and workflow.signature),
         "scheduler_running": bool(scheduler_running),
+        "scheduler_health": scheduler_health,
         "current_step": current_step if current_step is None else max(0, int(current_step)),
         "checkpoint_pending": bool(checkpoint),
         "summary": summary,

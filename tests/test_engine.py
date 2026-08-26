@@ -22,6 +22,7 @@ from app.engine import (
     export_execution_report_summary,
     cleanup_workflow_backups,
     evaluate_monitor_alerts,
+    evaluate_scheduler_health,
     export_support_bundle,
     clear_execution_checkpoint,
     load_execution_checkpoint,
@@ -638,6 +639,35 @@ def test_player_pause_and_resume_state():
     assert player.paused is False
     player.stop()
     assert player.paused is False
+
+
+def test_scheduler_health_opens_after_consecutive_scheduled_failures():
+    records = [
+        {"event": "playback_failed", "scheduled": True},
+        {"event": "playback_failed", "scheduled": True},
+        {"event": "playback_completed", "scheduled": True},
+        {"event": "playback_failed", "scheduled": True},
+        {"event": "playback_failed", "scheduled": True},
+        {"event": "playback_failed", "scheduled": True},
+    ]
+    health = evaluate_scheduler_health(records, window=5, failure_threshold=3)
+    assert health["failures"] == 4
+    assert health["consecutive_failures"] == 3
+    assert health["circuit_open"] is True
+    reset = evaluate_scheduler_health(records + [{"event": "playback_completed", "scheduled": True}])
+    assert reset["consecutive_failures"] == 0
+    assert reset["circuit_open"] is False
+
+
+def test_scheduler_health_ignores_manual_failures_and_honors_threshold():
+    records = [
+        {"event": "playback_failed", "scheduled": False},
+        {"event": "playback_failed", "scheduled": False},
+        {"event": "playback_failed", "scheduled": True},
+        {"event": "playback_failed", "scheduled": True},
+    ]
+    assert evaluate_scheduler_health(records)["circuit_open"] is False
+    assert evaluate_scheduler_health(records, failure_threshold=2)["circuit_open"] is True
 
 
 def test_execution_report_is_privacy_conscious_and_bounded(tmp_path: Path, monkeypatch):
